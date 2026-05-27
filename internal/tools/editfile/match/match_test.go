@@ -220,6 +220,34 @@ func TestEscapeNormalizedNoOpWhenNothingToUnescape(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// TrimmedBoundary pass
+// -----------------------------------------------------------------------------
+
+func TestTrimmedBoundaryOuterWhitespaceOnly(t *testing.T) {
+	got, ok := TrimmedBoundary("x = 1\n", "\n\n  x = 1  \n\n")
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if got != "x = 1" {
+		t.Errorf("Actual = %q, want %q", got, "x = 1")
+	}
+}
+
+func TestTrimmedBoundaryRejectsEmptyAfterTrim(t *testing.T) {
+	_, ok := TrimmedBoundary("anything\n", "\n\n\n")
+	if ok {
+		t.Error("ok = true on all-whitespace old; want false (defensive empty-match guard)")
+	}
+}
+
+func TestTrimmedBoundaryNoOpWhenAlreadyTrimmed(t *testing.T) {
+	_, ok := TrimmedBoundary("x = 1\n", "x = 1")
+	if ok {
+		t.Error("ok = true, want false (trim was a no-op — Simple already handled this)")
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Find / FindWith dispatch
 // -----------------------------------------------------------------------------
 

@@ -53,6 +53,7 @@ var DefaultPasses = []Pass{
 	{Name: "whitespace_normalized", Fn: WhitespaceNormalized},
 	{Name: "indentation_flexible", Fn: IndentationFlexible},
 	{Name: "escape_normalized", Fn: EscapeNormalized},
+	{Name: "trimmed_boundary", Fn: TrimmedBoundary},
 }
 
 // Find runs DefaultPasses on (original, old) and returns the first

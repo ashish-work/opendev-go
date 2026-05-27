@@ -526,3 +526,94 @@ func unescape(s string) string {
 	s = strings.ReplaceAll(s, `\'`, `'`)
 	return s
 }
+
+// -----------------------------------------------------------------------------
+// Pass 7 — TrimmedBoundary: drop outer whitespace + line-level boundary expand
+// -----------------------------------------------------------------------------
+
+// TrimmedBoundary handles `old` strings surrounded by extra whitespace
+// at the very edges — leading/trailing newlines, padding spaces, or
+// entire blank lines the model accidentally captured.
+//
+// Strategy (two-stage):
+//  1. Trim the whole `old`. If unchanged, this pass is a no-op.
+//  2. If the trimmed form appears verbatim in `original`, return it.
+//  3. Otherwise, line-level boundary expansion: take the first
+//     non-empty line content and the last non-empty line content of
+//     `old`. Find an original line that CONTAINS the first content,
+//     then a later original line that CONTAINS the last content. The
+//     contiguous span is the candidate.
+//
+// Example (outer noise only):
+//
+//	original: "x = 1\n"
+//	old:      "\n\n  x = 1  \n\n"
+//
+//	trimmed = "x = 1"
+//	→ ("x = 1", true)        // appears in original verbatim
+//
+// Example (line-level expansion):
+//
+//	original: "    open()\n        body\n    close()\n"
+//	old:      "\nopen()  \n  body\n  close()\n\n"
+//
+//	trim(old) != old (outer noise present)
+//	trim(old) not in original (inner spacing differs)
+//	first content "open()" — line 0 contains it.
+//	last content "close()" — line 2 contains it.
+//	→ ("    open()\n        body\n    close()", true)
+//
+// Example (rejected — empty boundaries):
+//
+//	old: "\n\n\n"
+//	→ ("", false)   // first/last content lines are empty → can't anchor
+func TrimmedBoundary(original, old string) (string, bool) {
+	trimmed := strings.TrimSpace(old)
+	if trimmed == "" {
+		// Empty pattern would match everywhere via strings.Contains —
+		// guard explicitly. Same defensive check as Execute's empty
+		// old_string rejection in editfile.go.
+		return "", false
+	}
+	if trimmed == old {
+		return "", false // nothing to trim
+	}
+	if strings.Contains(original, trimmed) {
+		return trimmed, true
+	}
+
+	// Line-level boundary expansion.
+	oldLines := strings.Split(old, "\n")
+	if len(oldLines) < 2 {
+		return "", false
+	}
+	firstContent := strings.TrimSpace(oldLines[0])
+	lastContent := strings.TrimSpace(oldLines[len(oldLines)-1])
+	if firstContent == "" || lastContent == "" {
+		return "", false
+	}
+
+	originalLines := strings.Split(original, "\n")
+	for i := 0; i < len(originalLines); i++ {
+		if !strings.Contains(originalLines[i], firstContent) {
+			continue
+		}
+		end := i + len(oldLines) + 2
+		if end > len(originalLines) {
+			end = len(originalLines)
+		}
+		for j := i + 1; j < end; j++ {
+			if j >= len(originalLines) {
+				break
+			}
+			if !strings.Contains(originalLines[j], lastContent) {
+				continue
+			}
+			candidate := strings.Join(originalLines[i:j+1], "\n")
+			if strings.Contains(original, candidate) {
+				return candidate, true
+			}
+		}
+	}
+	return "", false
+}
