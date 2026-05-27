@@ -470,3 +470,59 @@ func IndentationFlexible(original, old string) (string, bool) {
 	}
 	return "", false
 }
+
+// -----------------------------------------------------------------------------
+// Pass 6 — EscapeNormalized: turn literal escape sequences into real chars
+// -----------------------------------------------------------------------------
+
+// EscapeNormalized handles the case where the model produced LITERAL
+// escape sequences ("\\n", "\\t", etc.) where the file has the actual
+// characters. Happens when the model's input went through a JSON encode
+// that double-escaped, or when the model literally typed `\n` thinking
+// it would be interpreted as a newline.
+//
+// Strategy:
+//  1. Unescape the well-known sequences: \n → newline, \t → tab,
+//     \\ → \, \" → ", \' → '
+//  2. If unescaping changed nothing, this pass has nothing to offer.
+//  3. Otherwise, check whether the unescaped form is a substring of
+//     `original`.
+//
+// Example:
+//
+//	original: "line one\nline two\n"   // real newline
+//	old:      `line one\nline two`     // literal backslash-n
+//
+//	unescape(old) = "line one\nline two"  // real newline now
+//	→ ("line one\nline two", true)
+//
+// Example (unescape was a no-op → skip):
+//
+//	old: "no escapes here"
+//	→ ("", false)   // identity means nothing for this pass to add
+func EscapeNormalized(original, old string) (string, bool) {
+	unescaped := unescape(old)
+	if unescaped == old {
+		return "", false
+	}
+	if strings.Contains(original, unescaped) {
+		return unescaped, true
+	}
+	return "", false
+}
+
+// unescape replaces the common LLM-emitted escape sequences with the
+// characters they represent. Order matters: \n / \t go before \\ so
+// that "\\n" (the model literally typing backslash+n) becomes a
+// newline before the doubled-backslash pass runs.
+//
+// This is a known-incomplete unescaper — sequences like \xNN or \uNNNN
+// aren't handled. v1 covers the cases LLMs hit in practice.
+func unescape(s string) string {
+	s = strings.ReplaceAll(s, `\n`, "\n")
+	s = strings.ReplaceAll(s, `\t`, "\t")
+	s = strings.ReplaceAll(s, `\\`, `\`)
+	s = strings.ReplaceAll(s, `\"`, `"`)
+	s = strings.ReplaceAll(s, `\'`, `'`)
+	return s
+}

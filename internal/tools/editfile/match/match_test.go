@@ -197,6 +197,29 @@ func TestIndentationFlexibleRejectsAllBlankOld(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// EscapeNormalized pass
+// -----------------------------------------------------------------------------
+
+func TestEscapeNormalizedLiteralBackslashN(t *testing.T) {
+	original := "line one\nline two\n"
+	old := `line one\nline two` // backslash + n, not real newline
+	got, ok := EscapeNormalized(original, old)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if got != "line one\nline two" {
+		t.Errorf("Actual = %q, want %q", got, "line one\nline two")
+	}
+}
+
+func TestEscapeNormalizedNoOpWhenNothingToUnescape(t *testing.T) {
+	_, ok := EscapeNormalized("no escapes here\n", "no escapes here")
+	if ok {
+		t.Error("ok = true on identity unescape; want false")
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Find / FindWith dispatch
 // -----------------------------------------------------------------------------
 
