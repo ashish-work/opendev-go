@@ -60,12 +60,19 @@ func (t *Tool) Name() string { return ToolName }
 // the system prompt no longer carries per-tool sections.
 func (t *Tool) Description() string {
 	return "Execute a shell command via `sh -c`. Returns combined stdout+stderr. " +
-		"Use bash for filesystem inspection (ls, find, grep, head, tail, wc), " +
-		"running tests, checking build status, inspecting git state, or any " +
-		"shell-based investigation. Combine multiple steps with && or ; to " +
-		"minimize round trips when the steps are tightly coupled — prefer " +
-		"separate tool calls when each step's success matters to the next " +
-		"decision. Supports pipes, redirects, env vars, and chained commands. " +
+		"Use bash for running tests, build commands, git inspection, content " +
+		"search (`grep -rn pattern`, or `rg pattern` if ripgrep is installed), " +
+		"and any other shell-based investigation. Combine multiple steps with " +
+		"&& or ; to minimize round trips when the steps are tightly coupled — " +
+		"prefer separate tool calls when each step's success matters to the " +
+		"next decision. Supports pipes, redirects, env vars, and chained " +
+		"commands. " +
+		"For file DISCOVERY (\"what files exist under X?\", \"where are " +
+		"the .go files?\") prefer the dedicated list_files tool over " +
+		"`ls`/`find` here — list_files returns structured paths, respects " +
+		".gitignore, and skips conventional noise (node_modules, .git, " +
+		"target, etc.) automatically. Bash is right for content search " +
+		"(`grep -rn`) and other shell-specific work. " +
 		"Default timeout is 60 seconds; specify timeout_sec (up to 600) for " +
 		"longer-running commands. " +
 		"When output exceeds 50 KB or 2000 lines, the full result is saved " +
