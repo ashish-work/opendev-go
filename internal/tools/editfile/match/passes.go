@@ -1,6 +1,9 @@
 package match
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // -----------------------------------------------------------------------------
 // Pass 1 — Simple: exact substring match
@@ -301,4 +304,74 @@ func lcsLength(a, b []byte) int {
 		}
 	}
 	return best
+}
+
+// -----------------------------------------------------------------------------
+// Pass 4 — WhitespaceNormalized: collapse \s+ to single space per line
+// -----------------------------------------------------------------------------
+
+// wsRe matches runs of whitespace within a single line. We split the
+// input into lines first, so this never crosses newlines.
+var wsRe = regexp.MustCompile(`\s+`)
+
+// wsNormalize collapses each line's internal whitespace to single
+// spaces and trims line edges. Preserves line breaks so we can compare
+// line-by-line. The regex is compiled once at package init via
+// regexp.MustCompile.
+//
+// Examples:
+//
+//	wsNormalize("x  =\t1  +  2")  = "x = 1 + 2"   // runs collapsed
+//	wsNormalize("  hello  world ") = "hello world" // edges trimmed
+//	wsNormalize("a\n  b  \nc")    = "a\nb\nc"     // per-line normalize
+//	wsNormalize("x=1+2")           = "x=1+2"       // no whitespace → unchanged
+func wsNormalize(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = strings.TrimSpace(wsRe.ReplaceAllString(ln, " "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// WhitespaceNormalized matches when the model collapsed (or expanded)
+// whitespace runs in ways LineTrimmed can't recover from — e.g.,
+// "if  x  ==  1" vs "if x == 1". Walks a sliding window around the
+// expected line count and compares the normalized forms.
+//
+// IMPORTANT: this pass collapses RUNS of whitespace but cannot ADD or
+// REMOVE whitespace where it doesn't exist on the other side. So:
+//
+//	"x=1"   vs "x = 1"   → MISMATCH  (one has no whitespace at all)
+//	"x  =1" vs "x = 1"   → MATCH     (both have some whitespace, runs differ)
+//	"a\tb"  vs "a   b"   → MATCH     (\t and "   " both collapse to " ")
+//
+// Strategy:
+//  1. Normalize `old` once (collapse \s+ → " " per line, trim each).
+//  2. For each starting line i in `original`, try window sizes from
+//     ~oldLineCount to oldLineCount+2.
+//  3. Normalize the candidate window; compare to the normalized `old`.
+//  4. On match, return the candidate as it appeared in `original`
+//     (un-normalized) so the replacement preserves real bytes.
+func WhitespaceNormalized(original, old string) (string, bool) {
+	normOld := wsNormalize(old)
+	originalLines := strings.Split(original, "\n")
+	oldLineCount := strings.Count(old, "\n") + 1
+
+	for i := 0; i < len(originalLines); i++ {
+		endMax := i + oldLineCount + 2
+		if endMax > len(originalLines) {
+			endMax = len(originalLines)
+		}
+		startJ := i + oldLineCount - 1
+		for j := startJ; j <= endMax; j++ {
+			if j > len(originalLines) || j < i {
+				break
+			}
+			candidate := strings.Join(originalLines[i:j], "\n")
+			if wsNormalize(candidate) == normOld && strings.Contains(original, candidate) {
+				return candidate, true
+			}
+		}
+	}
+	return "", false
 }

@@ -139,6 +139,33 @@ func TestBlockAnchorFailsWhenAnchorsAbsent(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// WhitespaceNormalized pass
+// -----------------------------------------------------------------------------
+
+func TestWhitespaceNormalizedCollapsesSpaces(t *testing.T) {
+	// File uses tabs + double spaces; old uses single spaces. Both
+	// normalize to "x = 1 + 2".
+	original := "    x  =\t1  +  2\n"
+	old := "x = 1 + 2"
+	got, ok := WhitespaceNormalized(original, old)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if !strings.Contains(original, got) {
+		t.Errorf("Actual %q not a substring of original", got)
+	}
+}
+
+func TestWhitespaceNormalizedNoMatch(t *testing.T) {
+	// "x=1" has no whitespace; "x = 1" does. wsNormalize cannot ADD
+	// whitespace, so this pass can't reconcile them.
+	_, ok := WhitespaceNormalized("x=1\n", "x = 1")
+	if ok {
+		t.Error("ok = true, want false")
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Find / FindWith dispatch
 // -----------------------------------------------------------------------------
 
