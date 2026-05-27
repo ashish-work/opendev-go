@@ -166,6 +166,37 @@ func TestWhitespaceNormalizedNoMatch(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// IndentationFlexible pass
+// -----------------------------------------------------------------------------
+
+func TestIndentationFlexibleSkipsBlankLines(t *testing.T) {
+	original := "    a\n\n    b\n\n    c\n"
+	old := "a\nb\nc"
+	got, ok := IndentationFlexible(original, old)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	// Returned span MUST include the blank lines (contiguous slice).
+	if !strings.Contains(got, "\n\n") {
+		t.Errorf("Actual %q does not contain blank lines from original", got)
+	}
+}
+
+func TestIndentationFlexibleAbortsOnMismatch(t *testing.T) {
+	_, ok := IndentationFlexible("a\nb\nc\n", "a\nXXX\nc")
+	if ok {
+		t.Error("ok = true, want false (greedy walk should abort)")
+	}
+}
+
+func TestIndentationFlexibleRejectsAllBlankOld(t *testing.T) {
+	_, ok := IndentationFlexible("anything\n", "   \n\t\t\n   ")
+	if ok {
+		t.Error("ok = true, want false (all-blank old)")
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Find / FindWith dispatch
 // -----------------------------------------------------------------------------
 

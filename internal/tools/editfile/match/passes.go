@@ -375,3 +375,98 @@ func WhitespaceNormalized(original, old string) (string, bool) {
 	}
 	return "", false
 }
+
+// -----------------------------------------------------------------------------
+// Pass 5 — IndentationFlexible: strip indent, skip blanks, greedy match
+// -----------------------------------------------------------------------------
+
+// IndentationFlexible handles patterns where the model dropped indents
+// and possibly removed blank lines. Walks `original` line-by-line,
+// skipping blanks, greedily matching the next non-blank line against
+// the next non-blank line of `old`. On full match, returns the
+// contiguous slice — INCLUDING any skipped blanks — so the replacement
+// removes the whole region the model intended to delete/edit.
+//
+// Strategy:
+//  1. Strip indent from every line of `old`; drop any blank lines.
+//  2. For each start position in `original` where line.trim() ==
+//     oldStripped[0], scan forward up to 3× the old length.
+//  3. While scanning, skip blank lines; greedily match each non-blank
+//     against the next oldStripped entry. Abort on a mismatch.
+//  4. On a complete walk, return original[first_match .. last_match+1]
+//     (CONTIGUOUS — includes any blank lines that were skipped during
+//     matching).
+//
+// Example (file has blanks; old doesn't):
+//
+//	original: "    a\n\n    b\n\n    c\n"
+//	old:      "a\nb\nc"
+//
+//	oldStripped: ["a", "b", "c"]
+//
+//	Scan from line 0:
+//	  line 0 "    a"  trim="a"  match oldStripped[0]  ✓
+//	  line 1 ""       trim=""   skip blank
+//	  line 2 "    b"  trim="b"  match oldStripped[1]  ✓
+//	  line 3 ""       trim=""   skip blank
+//	  line 4 "    c"  trim="c"  match oldStripped[2]  ✓
+//
+//	Return slice [0..5] = "    a\n\n    b\n\n    c"
+//	(includes the blank lines — they get replaced too)
+//
+// Example (rejected — middle mismatch):
+//
+//	original: "a\nb\nc\n"
+//	old:      "a\nXXX\nc"
+//	→ ("", false)    // greedy walk aborts on "b" ≠ "XXX"
+func IndentationFlexible(original, old string) (string, bool) {
+	oldStripped := make([]string, 0)
+	for _, l := range strings.Split(old, "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			oldStripped = append(oldStripped, t)
+		}
+	}
+	if len(oldStripped) == 0 {
+		return "", false
+	}
+
+	originalLines := strings.Split(original, "\n")
+
+	for i := 0; i < len(originalLines); i++ {
+		if strings.TrimSpace(originalLines[i]) != oldStripped[0] {
+			continue
+		}
+
+		matchedIndices := make([]int, 0, len(oldStripped))
+		j := 0
+		searchEnd := i + len(oldStripped)*3
+		if searchEnd > len(originalLines) {
+			searchEnd = len(originalLines)
+		}
+		for k := i; k < searchEnd; k++ {
+			if j >= len(oldStripped) {
+				break
+			}
+			trimmed := strings.TrimSpace(originalLines[k])
+			if trimmed == "" {
+				continue // skip blank lines
+			}
+			if trimmed == oldStripped[j] {
+				matchedIndices = append(matchedIndices, k)
+				j++
+			} else {
+				break // mismatch — abandon this anchor
+			}
+		}
+
+		if j == len(oldStripped) && len(matchedIndices) > 0 {
+			start := matchedIndices[0]
+			end := matchedIndices[len(matchedIndices)-1] + 1
+			actual := strings.Join(originalLines[start:end], "\n")
+			if strings.Contains(original, actual) {
+				return actual, true
+			}
+		}
+	}
+	return "", false
+}
