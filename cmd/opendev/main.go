@@ -29,6 +29,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/tools/readfile"
 	"github.com/ashish-work/opendev-go/internal/tools/todo"
 	"github.com/ashish-work/opendev-go/internal/tools/truncation"
+	"github.com/ashish-work/opendev-go/internal/tools/webfetch"
 	"github.com/ashish-work/opendev-go/internal/tools/writefile"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
@@ -81,6 +82,7 @@ func main() {
 	mustRegister(registry, writefile.New())
 	mustRegister(registry, listfiles.New())
 	mustRegister(registry, todo.New())
+	mustRegister(registry, webfetch.New())
 
 	loop := agents.NewReactLoop(caller, registry, agents.Config{
 		Workflow: workflow.Config{

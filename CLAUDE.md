@@ -95,6 +95,14 @@ Third-party additions (each recorded with a justification):
 - `github.com/sergi/go-diff` — generates unified-diff output for
   `edit_file` results. BSD-licensed, no transitive deps.
 
+- `golang.org/x/net/html` — DOM-based HTML parser used by
+  `web_fetch` to convert HTML responses to plain text. Go-team
+  maintained, BSD-licensed, no transitive runtime deps. Picked
+  over a regex-based approach because real-world HTML has
+  unclosed tags, nested elements, and entity escapes that regex
+  patterns handle poorly. Pinned to v0.43.0 to keep the module's
+  Go directive at 1.24.1 (newer x/net releases require Go 1.25+).
+
 Adding another third-party dep requires a recorded decision in this
 file first.
 
