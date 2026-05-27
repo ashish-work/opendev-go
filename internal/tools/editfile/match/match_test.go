@@ -1,6 +1,7 @@
 package match
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -54,6 +55,37 @@ func TestSimpleEmptyOldMatchesEverything(t *testing.T) {
 	got, ok := Simple("anything", "")
 	if !ok || got != "" {
 		t.Errorf("got (%q, %v), want (%q, true)", got, ok, "")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// LineTrimmed pass
+// -----------------------------------------------------------------------------
+
+func TestLineTrimmedMatchesWithExtraIndent(t *testing.T) {
+	original := "    fn foo() {\n        return 1\n    }\n"
+	old := "fn foo() {\nreturn 1\n}"
+	got, ok := LineTrimmed(original, old)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	// Returned span is the untrimmed slice of original (preserves indent).
+	if !strings.Contains(original, got) {
+		t.Errorf("Actual %q not a substring of original", got)
+	}
+}
+
+func TestLineTrimmedRejectsAllWhitespacePattern(t *testing.T) {
+	_, ok := LineTrimmed("anything\nat all\n", "   \n\t\t\n  ")
+	if ok {
+		t.Error("ok = true on all-whitespace old; want false")
+	}
+}
+
+func TestLineTrimmedNoMatchWhenContentDiffers(t *testing.T) {
+	_, ok := LineTrimmed("foo\nbar\nbaz\n", "qux\nquux\n")
+	if ok {
+		t.Error("ok = true, want false")
 	}
 }
 

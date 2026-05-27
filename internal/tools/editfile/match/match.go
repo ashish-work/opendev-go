@@ -48,6 +48,7 @@ type Result struct {
 // land — for now, only the Simple pass is wired up.
 var DefaultPasses = []Pass{
 	{Name: "simple", Fn: Simple},
+	{Name: "line_trimmed", Fn: LineTrimmed},
 }
 
 // Find runs DefaultPasses on (original, old) and returns the first
