@@ -7,6 +7,7 @@ import (
 	"github.com/ashishgupta/opendev-go/internal/cost"
 	"github.com/ashishgupta/opendev-go/internal/provider"
 	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashishgupta/opendev-go/internal/workflow"
 )
 
 // DefaultMaxIterations caps how many model→tool→model cycles one Run
@@ -17,9 +18,11 @@ const DefaultMaxIterations = 25
 // Config holds the per-run knobs for a ReactLoop. Constructor fills in
 // defaults for zero values so the zero Config is usable.
 type Config struct {
-	// Model is the provider-specific identifier (e.g. "gpt-4o").
-	// Passed through to provider.Request.Model unchanged.
-	Model string
+	// Workflow names a model per slot (Execution/Thinking/Compact/
+	// Critique/VLM). v1 only routes through SlotExecution; unset slots
+	// transparently fall back to it. Execution.Model must be set or
+	// the provider will reject the request.
+	Workflow workflow.Config
 
 	// MaxIterations is the loop cap. Zero falls back to DefaultMaxIterations.
 	MaxIterations int
@@ -98,7 +101,7 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 		}
 
 		req := provider.Request{
-			Model:    l.Config.Model,
+			Model:    l.Config.Workflow.Resolve(workflow.SlotExecution).Model,
 			Messages: history,
 			Tools:    SchemasFor(l.Registry),
 		}

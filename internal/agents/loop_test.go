@@ -11,6 +11,7 @@ import (
 	"github.com/ashishgupta/opendev-go/internal/cost"
 	"github.com/ashishgupta/opendev-go/internal/provider"
 	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashishgupta/opendev-go/internal/workflow"
 )
 
 // fakeProvider is a scripted Provider for loop tests. Each Call pops
@@ -76,7 +77,9 @@ func newLoop(t *testing.T, provider *fakeProvider, toolsList []tools.Tool) *Reac
 		}
 	}
 	caller := NewLlmCaller(provider, cost.Pricing{InputPricePerMillion: 1, OutputPricePerMillion: 2})
-	return NewReactLoop(caller, reg, Config{Model: "test-model"})
+	return NewReactLoop(caller, reg, Config{
+		Workflow: workflow.Config{Execution: workflow.SlotConfig{Model: "test-model"}},
+	})
 }
 
 func TestSingleTurnCompletion(t *testing.T) {
@@ -202,7 +205,10 @@ func TestMaxIterations(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	caller := NewLlmCaller(p, cost.Pricing{})
-	cfg := Config{Model: "test", MaxIterations: 3}
+	cfg := Config{
+		Workflow:      workflow.Config{Execution: workflow.SlotConfig{Model: "test"}},
+		MaxIterations: 3,
+	}
 	loop := NewReactLoop(caller, reg, cfg)
 
 	_, _, err := loop.Run(context.Background(), "go")

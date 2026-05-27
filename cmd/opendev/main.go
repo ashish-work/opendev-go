@@ -26,6 +26,7 @@ import (
 	"github.com/ashishgupta/opendev-go/internal/tools/bash"
 	"github.com/ashishgupta/opendev-go/internal/tools/editfile"
 	"github.com/ashishgupta/opendev-go/internal/tools/readfile"
+	"github.com/ashishgupta/opendev-go/internal/workflow"
 )
 
 // Banner shown on startup. Kept short.
@@ -69,7 +70,9 @@ func main() {
 	mustRegister(registry, editfile.New())
 
 	loop := agents.NewReactLoop(caller, registry, agents.Config{
-		Model:         *model,
+		Workflow: workflow.Config{
+			Execution: workflow.SlotConfig{Model: *model},
+		},
 		MaxIterations: *maxIter,
 		SystemPrompt:  *systemPrompt,
 		WorkingDir:    workingDir,
