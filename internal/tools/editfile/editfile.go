@@ -20,12 +20,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
 
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/tools/editfile/match"
+	"github.com/ashish-work/opendev-go/internal/tools/filelock"
 )
 
 // ToolName is the canonical name the model uses to invoke this tool.
@@ -38,25 +38,10 @@ var (
 	maxFileSize int64 = 10 * 1024 * 1024
 )
 
-// fileLocks maps absolute paths to per-file mutexes. sync.Map is the
-// right shape: many keys (one per touched file), each touched briefly
-// during read/modify/write. LoadOrStore atomically creates the mutex
-// the first time a path is edited.
-//
-// Locks are never deleted — they're cheap (24 bytes) and the set of
-// files touched in a session is bounded. Garbage-collecting the map
-// would require ref-counting; not worth the complexity for v1.
-var fileLocks sync.Map
-
-// lockFor returns the (singleton) mutex for the given absolute path.
-// Always paired with Lock/defer Unlock at the call site.
-func lockFor(path string) *sync.Mutex {
-	actual, _ := fileLocks.LoadOrStore(path, &sync.Mutex{})
-	return actual.(*sync.Mutex)
-}
-
 // Tool implements tools.Tool for the edit_file operation. Stateless —
-// per-file synchronization lives in the package-level fileLocks map.
+// per-file synchronization is delegated to the filelock package, which
+// is shared with write_file so concurrent edits/writes to the same
+// path serialize correctly.
 type Tool struct{}
 
 // New returns a ready-to-register Tool.
@@ -154,8 +139,10 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 		return tools.ToolResult{}, err
 	}
 
-	// Per-file serialization. Different files don't contend.
-	mu := lockFor(abs)
+	// Per-file serialization. Different files don't contend. The lock
+	// is shared with write_file via the filelock package so concurrent
+	// edits and writes to the same path are also coordinated.
+	mu := filelock.For(abs)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -204,7 +191,7 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 		replaced = 1
 	}
 
-	if err := atomicWrite(abs, []byte(newContent), info.Mode()); err != nil {
+	if err := filelock.AtomicWrite(abs, []byte(newContent), info.Mode()); err != nil {
 		// Write failures are infrastructure errors — partial state
 		// could leave the user in a bad place, so surface as a Go
 		// error rather than a tool-domain result.
@@ -293,42 +280,6 @@ func resolvePath(p, workingDir string) string {
 		return p
 	}
 	return filepath.Join(workingDir, p)
-}
-
-// atomicWrite writes data to a temp file in the same directory, then
-// renames it over the target. rename(2) is atomic on POSIX within a
-// single filesystem, so the file is either fully updated or fully
-// preserved — never half-written. mode preserves the original file's
-// permission bits.
-func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".edit-*")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	tmpName := tmp.Name()
-
-	// On any error after the temp is created, remove it.
-	cleanup := func() { _ = os.Remove(tmpName) }
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return fmt.Errorf("write temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		cleanup()
-		return fmt.Errorf("close temp: %w", err)
-	}
-	if err := os.Chmod(tmpName, mode); err != nil {
-		cleanup()
-		return fmt.Errorf("chmod temp: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		cleanup()
-		return fmt.Errorf("rename: %w", err)
-	}
-	return nil
 }
 
 // failf builds a Success:false ToolResult with a formatted message.

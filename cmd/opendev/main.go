@@ -27,6 +27,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/tools/editfile"
 	"github.com/ashish-work/opendev-go/internal/tools/readfile"
 	"github.com/ashish-work/opendev-go/internal/tools/truncation"
+	"github.com/ashish-work/opendev-go/internal/tools/writefile"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
 
@@ -75,6 +76,7 @@ func main() {
 	mustRegister(registry, readfile.New())
 	mustRegister(registry, bash.New())
 	mustRegister(registry, editfile.New())
+	mustRegister(registry, writefile.New())
 
 	loop := agents.NewReactLoop(caller, registry, agents.Config{
 		Workflow: workflow.Config{
