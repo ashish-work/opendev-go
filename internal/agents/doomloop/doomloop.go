@@ -28,7 +28,7 @@ import (
 	"hash/fnv"
 	"strings"
 
-	"github.com/ashishgupta/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
 const (

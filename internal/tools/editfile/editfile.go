@@ -24,8 +24,8 @@ import (
 
 	"github.com/sergi/go-diff/diffmatchpatch"
 
-	"github.com/ashishgupta/opendev-go/internal/tools"
-	"github.com/ashishgupta/opendev-go/internal/tools/editfile/match"
+	"github.com/ashish-work/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools/editfile/match"
 )
 
 // ToolName is the canonical name the model uses to invoke this tool.

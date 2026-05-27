@@ -3,8 +3,8 @@ package agents
 import (
 	"encoding/json"
 
-	"github.com/ashishgupta/opendev-go/internal/provider"
-	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/tools"
 )
 
 // DefaultSystemPrompt is the v1 stable agent prompt. Two-part caching

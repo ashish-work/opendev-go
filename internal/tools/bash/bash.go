@@ -20,8 +20,8 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/ashishgupta/opendev-go/internal/tools"
-	"github.com/ashishgupta/opendev-go/internal/tools/truncation"
+	"github.com/ashish-work/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools/truncation"
 )
 
 // ToolName is the canonical name the model uses to invoke this tool.

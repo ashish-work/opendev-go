@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ashishgupta/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
 // Compile-time assertion that *Client satisfies provider.Provider.

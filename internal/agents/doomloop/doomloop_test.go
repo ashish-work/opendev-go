@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ashishgupta/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
 // call is a tiny constructor — keeps test cases readable.

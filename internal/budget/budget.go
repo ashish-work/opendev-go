@@ -26,7 +26,7 @@ package budget
 import (
 	"strings"
 
-	"github.com/ashishgupta/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
 // Calibrator tracks the last reported prompt_tokens and the conversation

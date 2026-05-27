@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools"
 )
 
 func writeFile(t *testing.T, path, content string) {

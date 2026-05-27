@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools"
 )
 
 // run is a shorthand for Execute with a marshaled args struct.

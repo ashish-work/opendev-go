@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ashishgupta/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
 // newTestClient returns a Client wired to a test HTTP server. The

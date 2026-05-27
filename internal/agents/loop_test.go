@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ashishgupta/opendev-go/internal/cost"
-	"github.com/ashishgupta/opendev-go/internal/provider"
-	"github.com/ashishgupta/opendev-go/internal/tools"
-	"github.com/ashishgupta/opendev-go/internal/workflow"
+	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/workflow"
 )
 
 // fakeProvider is a scripted Provider for loop tests. Each Call pops

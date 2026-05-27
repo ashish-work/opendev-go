@@ -19,15 +19,15 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/ashishgupta/opendev-go/internal/agents"
-	"github.com/ashishgupta/opendev-go/internal/cost"
-	"github.com/ashishgupta/opendev-go/internal/provider/openai"
-	"github.com/ashishgupta/opendev-go/internal/tools"
-	"github.com/ashishgupta/opendev-go/internal/tools/bash"
-	"github.com/ashishgupta/opendev-go/internal/tools/editfile"
-	"github.com/ashishgupta/opendev-go/internal/tools/readfile"
-	"github.com/ashishgupta/opendev-go/internal/tools/truncation"
-	"github.com/ashishgupta/opendev-go/internal/workflow"
+	"github.com/ashish-work/opendev-go/internal/agents"
+	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/provider/openai"
+	"github.com/ashish-work/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools/bash"
+	"github.com/ashish-work/opendev-go/internal/tools/editfile"
+	"github.com/ashish-work/opendev-go/internal/tools/readfile"
+	"github.com/ashish-work/opendev-go/internal/tools/truncation"
+	"github.com/ashish-work/opendev-go/internal/workflow"
 )
 
 // Banner shown on startup. Kept short.

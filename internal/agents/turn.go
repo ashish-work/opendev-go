@@ -21,8 +21,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/ashishgupta/opendev-go/internal/budget"
-	"github.com/ashishgupta/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/budget"
+	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
 // TurnKind tags the variant of a TurnResult.

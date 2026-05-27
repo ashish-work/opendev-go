@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools"
 )
 
 // writeFile is a tiny helper for staging fixture files in t.TempDir.

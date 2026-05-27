@@ -3,8 +3,8 @@ package agents
 import (
 	"context"
 
-	"github.com/ashishgupta/opendev-go/internal/cost"
-	"github.com/ashishgupta/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
 // LlmCaller pairs a provider.Provider with model pricing so every call

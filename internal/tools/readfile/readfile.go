@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools"
 )
 
 // ToolName is the canonical name the model uses to invoke this tool.

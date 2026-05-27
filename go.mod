@@ -1,4 +1,4 @@
-module github.com/ashishgupta/opendev-go
+module github.com/ashish-work/opendev-go
 
 go 1.24.1
 
