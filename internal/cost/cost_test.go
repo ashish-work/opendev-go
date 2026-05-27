@@ -129,6 +129,45 @@ func TestTrackerAccumulates(t *testing.T) {
 	}
 }
 
+// TestTrackerAccumulatesCacheReadTokens — turn-2+ of a cached
+// conversation reports cached_tokens; the tracker must sum these
+// across calls so the REPL can show a running cache-hit total.
+func TestTrackerAccumulatesCacheReadTokens(t *testing.T) {
+	tracker := Tracker{}
+	pricing := Pricing{InputPricePerMillion: 3.0, OutputPricePerMillion: 15.0}
+
+	// Call 1: cold prompt, no cache hits.
+	tracker, _ = tracker.RecordUsage(
+		TokenUsage{PromptTokens: 2000, CompletionTokens: 50, CacheReadTokens: 0},
+		pricing,
+	)
+	if tracker.TotalCacheReadTokens != 0 {
+		t.Errorf("after cold call: TotalCacheReadTokens = %d, want 0", tracker.TotalCacheReadTokens)
+	}
+
+	// Call 2: 1500 of the 2100 input tokens served from cache.
+	tracker, _ = tracker.RecordUsage(
+		TokenUsage{PromptTokens: 2100, CompletionTokens: 30, CacheReadTokens: 1500},
+		pricing,
+	)
+	if tracker.TotalCacheReadTokens != 1500 {
+		t.Errorf("after 1st warm call: TotalCacheReadTokens = %d, want 1500", tracker.TotalCacheReadTokens)
+	}
+
+	// Call 3: more cache hits accumulate.
+	tracker, _ = tracker.RecordUsage(
+		TokenUsage{PromptTokens: 2200, CompletionTokens: 40, CacheReadTokens: 1800},
+		pricing,
+	)
+	if tracker.TotalCacheReadTokens != 3300 {
+		t.Errorf("after 2nd warm call: TotalCacheReadTokens = %d, want 3300", tracker.TotalCacheReadTokens)
+	}
+	// TotalInputTokens is independent — counts ALL input including cache.
+	if tracker.TotalInputTokens != 6300 {
+		t.Errorf("TotalInputTokens = %d, want 6300", tracker.TotalInputTokens)
+	}
+}
+
 // TestTrackerImmutable guards the global "no mutation" rule: calling
 // RecordUsage on a Tracker value must NOT change the original.
 func TestTrackerImmutable(t *testing.T) {

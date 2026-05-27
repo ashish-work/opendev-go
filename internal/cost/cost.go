@@ -55,10 +55,17 @@ type Pricing struct {
 // methods return a new Tracker; callers must reassign.
 type Tracker struct {
 	// TotalInputTokens — sum of PromptTokens across all calls.
+	// Note: PromptTokens INCLUDES tokens that were served from cache.
+	// TotalCacheReadTokens is the subset served from cache.
 	TotalInputTokens int64
 
 	// TotalOutputTokens — sum of CompletionTokens across all calls.
 	TotalOutputTokens int64
+
+	// TotalCacheReadTokens — sum of CacheReadTokens across all calls.
+	// Used by the REPL status line to surface cache hit rate; also
+	// drives the 10% pricing discount in computeCost.
+	TotalCacheReadTokens int64
 
 	// TotalCostUSD — sum of incremental costs across all calls.
 	TotalCostUSD float64
@@ -93,11 +100,12 @@ const (
 func (t Tracker) RecordUsage(usage TokenUsage, pricing Pricing) (Tracker, float64) {
 	incrementalCost := computeCost(usage, pricing)
 	return Tracker{
-		TotalInputTokens:  t.TotalInputTokens + usage.PromptTokens,
-		TotalOutputTokens: t.TotalOutputTokens + usage.CompletionTokens,
-		TotalCostUSD:      t.TotalCostUSD + incrementalCost,
-		CallCount:         t.CallCount + 1,
-		BudgetUSD:         t.BudgetUSD,
+		TotalInputTokens:     t.TotalInputTokens + usage.PromptTokens,
+		TotalOutputTokens:    t.TotalOutputTokens + usage.CompletionTokens,
+		TotalCacheReadTokens: t.TotalCacheReadTokens + usage.CacheReadTokens,
+		TotalCostUSD:         t.TotalCostUSD + incrementalCost,
+		CallCount:            t.CallCount + 1,
+		BudgetUSD:            t.BudgetUSD,
 	}, incrementalCost
 }
 
