@@ -24,6 +24,7 @@ import (
 	"github.com/ashishgupta/opendev-go/internal/provider/openai"
 	"github.com/ashishgupta/opendev-go/internal/tools"
 	"github.com/ashishgupta/opendev-go/internal/tools/bash"
+	"github.com/ashishgupta/opendev-go/internal/tools/editfile"
 	"github.com/ashishgupta/opendev-go/internal/tools/readfile"
 )
 
@@ -65,6 +66,7 @@ func main() {
 	registry := tools.NewRegistry()
 	mustRegister(registry, readfile.New())
 	mustRegister(registry, bash.New())
+	mustRegister(registry, editfile.New())
 
 	loop := agents.NewReactLoop(caller, registry, agents.Config{
 		Model:         *model,
