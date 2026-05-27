@@ -1,11 +1,11 @@
 // Package editfile implements the edit_file tool — the model's way to
 // modify file contents via find/replace.
 //
-// This commit lands EXACT-MATCH semantics: old_string must appear
-// verbatim in the file (whitespace and all). A later commit adds a
-// fuzzy-matcher chain so the model can tolerate minor whitespace
-// drift in its old_string input; the exact-match path stays as the
-// fast first pass.
+// The exact-match path is the foundation; the fuzzy-matcher chain in
+// the match subpackage handles whitespace and indentation drift in
+// the model's old_string input. This commit wires up the dispatch
+// (currently just the Simple pass); later commits add the rest of
+// the chain one by one.
 //
 // Concurrency: a per-file mutex prevents two simultaneous edits to
 // the same path from racing. Different files are independently
@@ -22,7 +22,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sergi/go-diff/diffmatchpatch"
+
 	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashishgupta/opendev-go/internal/tools/editfile/match"
 )
 
 // ToolName is the canonical name the model uses to invoke this tool.
@@ -72,7 +75,8 @@ func (t *Tool) Description() string {
 		"old_string must match the file content verbatim (including whitespace). " +
 		"If old_string appears more than once and replace_all is false, " +
 		"the call fails — include more surrounding context in old_string " +
-		"to disambiguate, or set replace_all=true."
+		"to disambiguate, or set replace_all=true. " +
+		"Returns a diff showing what changed."
 }
 
 // Schema is the JSON Schema for the model's tool-call arguments.
@@ -161,29 +165,42 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 	}
 	content := string(original)
 
-	// Exact-match find. A later commit replaces this with the fuzzy
-	// matcher chain that tolerates whitespace drift.
-	if !strings.Contains(content, a.OldString) {
+	// Run the matcher chain. If no pass finds the model's old_string
+	// (with any tolerated drift), report not-found.
+	matchResult, ok := match.Find(content, a.OldString)
+	if !ok {
 		return failf("old_string not found in %s", a.FilePath), nil
 	}
 
-	count := strings.Count(content, a.OldString)
+	// `actual` is the substring of the file we'll actually replace —
+	// may differ from a.OldString if a fuzzy pass corrected whitespace.
+	actual := matchResult.Actual
+
+	// Ambiguity check runs against the corrected `actual` so the count
+	// reflects what we'd really replace.
+	count := match.CountOccurrences(content, actual)
+	if count == 0 {
+		// Defensive: matcher said yes, count says no. Shouldn't happen
+		// because passes return substrings of `original`. Surface
+		// loudly if it ever does.
+		return failf("internal: matcher returned a span that does not appear in file"), nil
+	}
 	if count > 1 && !a.ReplaceAll {
 		return failf(
-			"%d occurrences of old_string found in %s; "+
+			"%d occurrences of old_string found in %s (matched via pass %q); "+
 				"include more surrounding context in old_string to make it unique, "+
 				"or set replace_all=true",
-			count, a.FilePath,
+			count, a.FilePath, matchResult.PassName,
 		), nil
 	}
 
 	var newContent string
 	var replaced int
 	if a.ReplaceAll {
-		newContent = strings.ReplaceAll(content, a.OldString, a.NewString)
+		newContent = strings.ReplaceAll(content, actual, a.NewString)
 		replaced = count
 	} else {
-		newContent = strings.Replace(content, a.OldString, a.NewString, 1)
+		newContent = strings.Replace(content, actual, a.NewString, 1)
 		replaced = 1
 	}
 
@@ -200,17 +217,73 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 		"bytes_before": len(original),
 		"bytes_after":  len(newContent),
 		"replace_all":  a.ReplaceAll,
+		"matcher_pass": matchResult.PassName,
 	}
 
-	suffix := ""
-	if replaced != 1 {
-		suffix = "s"
-	}
 	return tools.ToolResult{
 		Success:  true,
-		Output:   fmt.Sprintf("edited %s (%d occurrence%s)", a.FilePath, replaced, suffix),
+		Output:   renderDiff(a.FilePath, actual, a.NewString, replaced, matchResult.PassName),
 		Metadata: meta,
 	}, nil
+}
+
+// renderDiff produces a line-oriented unified-style diff of the edit
+// using sergi/go-diff. We diff at LINE granularity (not character) so
+// the output reads cleanly: every line in the changed region is tagged
+// with "-", "+", or " " — the format the model has seen in every git
+// diff it was trained on.
+//
+// The header line names the file, occurrence count, and which matcher
+// pass fired (helpful when a fuzzy pass corrected the model's input —
+// the model can spot drift in its own behavior).
+func renderDiff(path, oldText, newText string, n int, passName string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "edited %s (%d occurrence", path, n)
+	if n != 1 {
+		b.WriteString("s")
+	}
+	if passName != "" && passName != "simple" {
+		fmt.Fprintf(&b, ", matched via %s)\n", passName)
+	} else {
+		b.WriteString(")\n")
+	}
+	b.WriteString(unifiedLineDiff(oldText, newText))
+	return b.String()
+}
+
+// unifiedLineDiff returns a "-"/"+"/" "-prefixed line-by-line diff
+// of (oldText, newText). Uses sergi/go-diff's lines-to-chars trick to
+// drop char-level noise from the output.
+func unifiedLineDiff(oldText, newText string) string {
+	dmp := diffmatchpatch.New()
+	encOld, encNew, lineArr := dmp.DiffLinesToChars(oldText, newText)
+	diffs := dmp.DiffMain(encOld, encNew, false)
+	diffs = dmp.DiffCharsToLines(diffs, lineArr)
+
+	var b strings.Builder
+	for _, d := range diffs {
+		// Trim only the very last "\n" so we can emit one prefix per
+		// line; the underlying lines keep any in-string newlines.
+		text := strings.TrimRight(d.Text, "\n")
+		if text == "" {
+			continue
+		}
+		var prefix string
+		switch d.Type {
+		case diffmatchpatch.DiffInsert:
+			prefix = "+"
+		case diffmatchpatch.DiffDelete:
+			prefix = "-"
+		case diffmatchpatch.DiffEqual:
+			prefix = " "
+		}
+		for _, line := range strings.Split(text, "\n") {
+			b.WriteString(prefix)
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
 }
 
 // resolvePath joins a relative path against the working directory.

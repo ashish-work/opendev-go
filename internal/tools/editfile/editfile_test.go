@@ -330,21 +330,34 @@ func fmtName(i int) string {
 	return "f" + string(rune('0'+i/10)) + string(rune('0'+i%10)) + ".txt"
 }
 
-func TestOutputDescribesEdit(t *testing.T) {
+func TestOutputContainsUnifiedDiffMarkers(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "f.txt"), "before\n")
 	got := exec(t, dir, args{FilePath: "f.txt", OldString: "before", NewString: "after"})
 	if !got.Success {
 		t.Fatalf("Success = false: %s", got.Error)
 	}
-	// v1 exact-match Output is a one-line summary. A later commit
-	// upgrades this to a full unified diff once sergi/go-diff lands
-	// alongside the fuzzy matcher.
-	if !strings.Contains(got.Output, "edited f.txt") {
-		t.Errorf("Output missing 'edited f.txt': %q", got.Output)
+	// sergi/go-diff unified output: every changed line prefixed with
+	// "-" (removed) or "+" (added).
+	if !strings.Contains(got.Output, "-before") {
+		t.Errorf("Output missing '-before' marker: %q", got.Output)
 	}
-	if !strings.Contains(got.Output, "1 occurrence") {
-		t.Errorf("Output missing '1 occurrence': %q", got.Output)
+	if !strings.Contains(got.Output, "+after") {
+		t.Errorf("Output missing '+after' marker: %q", got.Output)
+	}
+}
+
+func TestSimplePassReportedInMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	writeFile(t, path, "hello\n")
+
+	got := exec(t, dir, args{FilePath: "f.txt", OldString: "hello", NewString: "world"})
+	if !got.Success {
+		t.Fatalf("Success = false: %s", got.Error)
+	}
+	if got.Metadata["matcher_pass"] != "simple" {
+		t.Errorf("matcher_pass = %v, want %q", got.Metadata["matcher_pass"], "simple")
 	}
 }
 
