@@ -139,8 +139,44 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 		// messages it just saw.
 		cal = cal.Update(resp.Usage.PromptTokens, msgCountAtRequest)
 
-		// Append the assistant's response to history regardless of
-		// whether it's a final answer or a tool-call turn.
+		// No tool calls = final answer. Append the assistant text and
+		// exit. We do this BEFORE the tool-call path so we can hold
+		// off on committing the assistant message until we've decided
+		// whether we will dispatch its tool_calls — appending an
+		// assistant message with tool_calls that don't get answered
+		// breaks OpenAI's "assistant(tool_calls) must be immediately
+		// followed by tool messages" contract.
+		if len(resp.ToolCalls) == 0 {
+			if resp.Content != "" {
+				history = append(history, provider.Message{
+					Role: "assistant",
+					Content: []provider.ContentBlock{
+						{Kind: provider.ContentText, Text: resp.Content},
+					},
+				})
+			}
+			return Result{
+				Content:  resp.Content,
+				Success:  true,
+				Messages: history,
+				Budget:   snapshot(),
+			}, tracker, nil
+		}
+
+		// Doom-loop check happens BEFORE we commit the assistant
+		// message to history. ForceStop discards the model's
+		// tool_calls (we refuse to dispatch and we don't record an
+		// assistant message whose tool_calls never get tool
+		// responses) — only a system note explaining the halt.
+		action, warning, recovery := detector.Check(resp.ToolCalls)
+		if action == doomloop.ForceStop {
+			history = append(history, SystemMessage(warning))
+			return Result{Messages: history, Budget: snapshot()}, tracker,
+				fmt.Errorf("%w: %s", ErrDoomLoop, warning)
+		}
+
+		// Commit the assistant message; we will dispatch its tools
+		// and append their results immediately below.
 		assistant := provider.Message{
 			Role:      "assistant",
 			ToolCalls: resp.ToolCalls,
@@ -151,28 +187,6 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 			}
 		}
 		history = append(history, assistant)
-
-		// No tool calls = final answer. Exit the loop with Success.
-		if len(resp.ToolCalls) == 0 {
-			return Result{
-				Content:  resp.Content,
-				Success:  true,
-				Messages: history,
-				Budget:   snapshot(),
-			}, tracker, nil
-		}
-
-		// Doom-loop check: fingerprint the proposed tool calls and
-		// look for repeating cycles. ForceStop halts before dispatch;
-		// Redirect/Notify inject guidance and let dispatch continue.
-		switch action, warning, recovery := detector.Check(resp.ToolCalls); action {
-		case doomloop.ForceStop:
-			history = append(history, SystemMessage(warning))
-			return Result{Messages: history, Budget: snapshot()}, tracker,
-				fmt.Errorf("%w: %s", ErrDoomLoop, warning)
-		case doomloop.Redirect, doomloop.Notify:
-			history = append(history, SystemMessage(warning+"\n\n"+recovery))
-		}
 
 		// Dispatch each tool call in order. Tool-domain failures
 		// (Success: false ToolResult) flow into history as observations
@@ -188,6 +202,14 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 					fmt.Errorf("%w: %s: %v", ErrToolExec, call.Name, dispatchErr)
 			}
 			history = append(history, ToolResultMessage(call.ID, call.Name, result))
+		}
+
+		// Doom-loop Redirect/Notify: append the warning + recovery
+		// hint AFTER all tool results. Inserting before would break
+		// OpenAI's tool_call → tool_response pairing contract (the
+		// REPL hit a 400 from exactly this ordering bug).
+		if action == doomloop.Redirect || action == doomloop.Notify {
+			history = append(history, SystemMessage(warning+"\n\n"+recovery))
 		}
 	}
 

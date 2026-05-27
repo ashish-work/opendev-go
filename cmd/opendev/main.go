@@ -174,6 +174,9 @@ func runTurn(loop *agents.ReactLoop, query string, sigs <-chan os.Signal) (float
 		if result.Content != "" {
 			fmt.Println(result.Content)
 		}
+	case errors.Is(err, agents.ErrDoomLoop):
+		fmt.Fprintln(os.Stderr, "(doom loop detected — model was repeating itself; halted)")
+		fmt.Fprintln(os.Stderr, "  try rephrasing your request or breaking it into smaller steps")
 	default:
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 	}

@@ -443,6 +443,62 @@ func TestDoomLoop_HaltsAfterThirdEscalation(t *testing.T) {
 	}
 }
 
+func TestDoomLoop_MessageOrderingValidForOpenAI(t *testing.T) {
+	// Regression: a real REPL run hit HTTP 400 from OpenAI when the
+	// model emitted 6 parallel identical tool calls in one batch.
+	// Cause: we appended a system "warning" message between the
+	// assistant(tool_calls) and the tool_result messages, breaking
+	// OpenAI's "assistant(tool_calls) must be immediately followed by
+	// tool messages" contract. This test pins the invariant: every
+	// assistant message that has tool_calls is followed directly by
+	// one tool message per tool_call_id, in order.
+	sixIdentical := []provider.ToolCall{
+		{ID: "a", Name: "noop", Arguments: json.RawMessage(`{}`)},
+		{ID: "b", Name: "noop", Arguments: json.RawMessage(`{}`)},
+		{ID: "c", Name: "noop", Arguments: json.RawMessage(`{}`)},
+		{ID: "d", Name: "noop", Arguments: json.RawMessage(`{}`)},
+		{ID: "e", Name: "noop", Arguments: json.RawMessage(`{}`)},
+		{ID: "f", Name: "noop", Arguments: json.RawMessage(`{}`)},
+	}
+	p := &fakeProvider{
+		responses: []provider.Response{
+			{ToolCalls: sixIdentical, FinishReason: "tool_calls"},
+			{Content: "done", FinishReason: "stop"},
+		},
+	}
+	loop := newLoop(t, p, []tools.Tool{echoTool("noop")})
+
+	result, _, err := loop.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	msgs := result.Messages
+	for i := 0; i < len(msgs); i++ {
+		m := msgs[i]
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		for j, tc := range m.ToolCalls {
+			idx := i + 1 + j
+			if idx >= len(msgs) {
+				t.Fatalf("assistant tool_call %q has no tool response (history ends at %d)",
+					tc.ID, idx)
+			}
+			got := msgs[idx]
+			if got.Role != "tool" {
+				t.Errorf("after assistant tool_calls, msg[%d].Role = %q, want \"tool\" (tool_call_id %q)",
+					idx, got.Role, tc.ID)
+			}
+			if got.ToolCallID != tc.ID {
+				t.Errorf("msg[%d].ToolCallID = %q, want %q",
+					idx, got.ToolCallID, tc.ID)
+			}
+		}
+		i += len(m.ToolCalls)
+	}
+}
+
 func TestDoomLoop_RedirectDoesNotHaltDispatch(t *testing.T) {
 	// 3 identical calls → Redirect. The loop should INJECT a warning
 	// system message and continue dispatching the tools. The 4th
