@@ -617,3 +617,116 @@ func TrimmedBoundary(original, old string) (string, bool) {
 	}
 	return "", false
 }
+
+// -----------------------------------------------------------------------------
+// Pass 8 — ContextAware: substring anchors + whole-region similarity scoring
+// -----------------------------------------------------------------------------
+
+// contextAwareSimilarityThreshold is the minimum LCS-based ratio a
+// ContextAware candidate must clear. Stricter than BlockAnchor's 0.3
+// because ContextAware's anchors are looser (substring, not equality),
+// so we want a higher whole-region match before accepting.
+const contextAwareSimilarityThreshold = 0.5
+
+// ContextAware uses the first and last non-empty lines of `old` as
+// LOOSE anchors (substring match, not equality) and scores candidates
+// by overall similarity. The fuzziest pass that still preserves the
+// model's intended region rather than line-by-line shape.
+//
+// Strategy:
+//  1. Find first/last non-empty lines of `old` (trimmed) — anchors.
+//  2. Find every line in `original` that CONTAINS the first anchor
+//     (substring; the file line can be a "superset" of the model's
+//     line).
+//  3. For each such start, scan forward up to 2× the old length
+//     looking for the FIRST line containing the last anchor. (Not
+//     exhaustive — bounds the algorithm at O(n·w).)
+//  4. Score the resulting span against `old` by similarity.
+//  5. Best span with similarity > 0.5 wins.
+//
+// Example:
+//
+//	original: "    fn begin_processing() {\n        helper();\n    }\n"
+//	old:      "fn begin\n  helper();\n}"
+//
+//	first anchor "fn begin" — file line "    fn begin_processing() {"
+//	  trimmed contains "fn begin"  ✓
+//	last anchor "}" — file line "    }" trimmed contains "}"  ✓
+//	span = file lines [0..2] joined
+//	similarity(old, span) ≈ 0.7 → above 0.5 threshold → match
+//	→ that span, true
+//
+// Example (rejected — too dissimilar):
+//
+//	original: "alpha\n  ... 50 lines of unrelated code ...\nbeta\n"
+//	old:      "alpha\nsmall body\nbeta"
+//	→ ("", false)   // similarity well under 0.5
+func ContextAware(original, old string) (string, bool) {
+	oldLines := strings.Split(old, "\n")
+	if len(oldLines) < 2 {
+		return "", false
+	}
+
+	originalLines := strings.Split(original, "\n")
+
+	// First non-empty trimmed line of `old`.
+	var firstCtx string
+	for _, l := range oldLines {
+		if t := strings.TrimSpace(l); t != "" {
+			firstCtx = t
+			break
+		}
+	}
+	if firstCtx == "" {
+		return "", false
+	}
+
+	// Last non-empty trimmed line of `old`.
+	var lastCtx string
+	for i := len(oldLines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(oldLines[i]); t != "" {
+			lastCtx = t
+			break
+		}
+	}
+	if lastCtx == "" {
+		return "", false
+	}
+
+	// Every position where a file line (trimmed) contains firstCtx.
+	var starts []int
+	for i, l := range originalLines {
+		if strings.Contains(strings.TrimSpace(l), firstCtx) {
+			starts = append(starts, i)
+		}
+	}
+	if len(starts) == 0 {
+		return "", false
+	}
+
+	var bestMatch string
+	var bestSim float64
+
+	for _, start := range starts {
+		searchEnd := start + len(oldLines)*2
+		if searchEnd > len(originalLines) {
+			searchEnd = len(originalLines)
+		}
+		for end := start + 1; end < searchEnd; end++ {
+			if strings.Contains(strings.TrimSpace(originalLines[end]), lastCtx) {
+				candidate := strings.Join(originalLines[start:end+1], "\n")
+				sim := similarity(strings.TrimSpace(old), strings.TrimSpace(candidate))
+				if sim > bestSim && sim > contextAwareSimilarityThreshold {
+					bestSim = sim
+					bestMatch = candidate
+				}
+				break // first end-anchor per start only (bounds search)
+			}
+		}
+	}
+
+	if bestMatch != "" && strings.Contains(original, bestMatch) {
+		return bestMatch, true
+	}
+	return "", false
+}

@@ -248,6 +248,29 @@ func TestTrimmedBoundaryNoOpWhenAlreadyTrimmed(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// ContextAware pass
+// -----------------------------------------------------------------------------
+
+func TestContextAwareSubstringAnchors(t *testing.T) {
+	original := "    fn begin_processing() {\n        helper();\n    }\n"
+	old := "fn begin\n  helper();\n}"
+	got, ok := ContextAware(original, old)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if !strings.Contains(original, got) {
+		t.Errorf("Actual %q not a substring of original", got)
+	}
+}
+
+func TestContextAwareRejectsSingleLineOld(t *testing.T) {
+	_, ok := ContextAware("anything", "single line")
+	if ok {
+		t.Error("ok = true on single-line old; want false (need first+last anchors)")
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Find / FindWith dispatch
 // -----------------------------------------------------------------------------
 

@@ -54,6 +54,7 @@ var DefaultPasses = []Pass{
 	{Name: "indentation_flexible", Fn: IndentationFlexible},
 	{Name: "escape_normalized", Fn: EscapeNormalized},
 	{Name: "trimmed_boundary", Fn: TrimmedBoundary},
+	{Name: "context_aware", Fn: ContextAware},
 }
 
 // Find runs DefaultPasses on (original, old) and returns the first
