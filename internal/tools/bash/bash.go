@@ -54,15 +54,28 @@ var _ tools.Tool = (*Tool)(nil)
 // Name implements tools.Tool. Stable — used in tool_calls history.
 func (t *Tool) Name() string { return ToolName }
 
-// Description tells the model what this tool does and the contract for
-// timeout + output truncation so it can plan around limits.
+// Description tells the model what this tool does, when to choose it,
+// and the truncation/timeout contract. This is the model's only
+// authoritative source for bash semantics — keep it accurate, since
+// the system prompt no longer carries per-tool sections.
 func (t *Tool) Description() string {
 	return "Execute a shell command via `sh -c`. Returns combined stdout+stderr. " +
-		"Supports pipes, redirects, env vars, and chained commands (&&, ||, ;). " +
-		"Defaults to a 60-second timeout; specify `timeout_sec` (up to 600) " +
-		"for longer-running commands. When output exceeds 50 KB or 2000 lines, " +
-		"the full result is saved to a file and the model receives a preview " +
-		"plus the file path — use read_file to view specific sections."
+		"Use bash for filesystem inspection (ls, find, grep, head, tail, wc), " +
+		"running tests, checking build status, inspecting git state, or any " +
+		"shell-based investigation. Combine multiple steps with && or ; to " +
+		"minimize round trips when the steps are tightly coupled — prefer " +
+		"separate tool calls when each step's success matters to the next " +
+		"decision. Supports pipes, redirects, env vars, and chained commands. " +
+		"Default timeout is 60 seconds; specify timeout_sec (up to 600) for " +
+		"longer-running commands. " +
+		"When output exceeds 50 KB or 2000 lines, the full result is saved " +
+		"to a file under ~/.opendev/tool-output/ and you receive a truncated " +
+		"preview plus the file path — use read_file with offset/limit on that " +
+		"path to fetch specific sections; do NOT assume the preview is the " +
+		"complete output. " +
+		"For long-running interactive commands or those waiting on stdin, " +
+		"the command will time out; redirect stdin from /dev/null, add " +
+		"--no-pager / --no-edit equivalents, or use a non-blocking variant."
 }
 
 // Schema is the JSON Schema for this tool's parameters, surfaced to the

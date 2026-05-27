@@ -60,14 +60,22 @@ var _ tools.Tool = (*Tool)(nil)
 func (t *Tool) Name() string { return ToolName }
 
 // Description is what the LLM sees in the tools array. Quality matters
-// here: vague descriptions degrade tool selection. We tell the model
-// what the tool does, what its inputs mean, and what its output looks
-// like (line-numbered prefix) so it can parse responses correctly.
+// here: vague descriptions degrade tool selection. This is the model's
+// only authoritative source for read_file semantics — keep it accurate,
+// since the system prompt no longer carries per-tool sections.
 func (t *Tool) Description() string {
-	return "Read the contents of a file from the local filesystem. " +
-		"Returns the file contents prefixed with line numbers (cat -n style). " +
-		"Use 'offset' (1-based) to start at a specific line, and 'limit' to cap " +
-		"the number of lines returned. Defaults to the first 2000 lines if not set."
+	return "Read the contents of a text file from the local filesystem. " +
+		"Provide an absolute or working-directory-relative path. " +
+		"Returns the file contents prefixed with line numbers in cat -n style — " +
+		"those line numbers are visual aids added by the renderer; they are " +
+		"NOT part of the file content itself, so do NOT include them when " +
+		"constructing edit_file old_string values (use the raw text). " +
+		"Use 'offset' (1-based line number) to start at a specific line, and " +
+		"'limit' to cap the number of lines returned. Defaults to the first " +
+		"2000 lines when neither is set. Use offset+limit to read specific " +
+		"sections of large files rather than loading them in full. " +
+		"For the spillover files produced by bash when its output is too " +
+		"large, read those files the same way to retrieve the section you need."
 }
 
 // Schema is the JSON Schema describing this tool's parameters. Surfaced

@@ -54,13 +54,31 @@ var (
 // Name implements tools.Tool. Stable — used in tool_calls history.
 func (t *Tool) Name() string { return ToolName }
 
-// Description tells the model the create-or-overwrite semantics and
-// when to prefer this over edit_file.
+// Description tells the model the create-or-overwrite semantics, when
+// to prefer this over edit_file, and the sensitive-path refusal
+// contract. This is the model's only authoritative source for
+// write_file semantics; keep it accurate, since the system prompt no
+// longer carries per-tool sections.
 func (t *Tool) Description() string {
-	return "Create a new file or overwrite an existing one with the given content. " +
-		"Optionally creates parent directories. Atomic: on success, the file is " +
-		"fully written; on failure, it is left unchanged. " +
-		"Use this for whole-file writes; use edit_file for find/replace within an existing file."
+	return "Create a new file or overwrite an existing one with the given " +
+		"content. Use this whenever you need to materialize a file from " +
+		"scratch — write_file is the correct primitive for creation; " +
+		"edit_file cannot create files. " +
+		"Pass file_path (absolute or working-directory-relative) and " +
+		"content (the full body, exactly as it should land on disk; an " +
+		"empty string creates an empty file). " +
+		"Atomic: on success the file holds exactly the new content; on " +
+		"failure the original is left untouched. " +
+		"By default missing parent directories are created automatically; " +
+		"set create_dirs to false to require the parent already exist. " +
+		"Mode is preserved when overwriting an existing file; new files " +
+		"are created with 0644. " +
+		"REFUSAL: paths whose basename looks like a credential or secret " +
+		"(.env, id_rsa, *.pem, *.key, .npmrc, credentials.json, " +
+		"service-account.json, *secret*.{json,yaml,yml}, etc.) return a " +
+		"failure with a clear reason. On that refusal, do NOT retry — " +
+		"explain to the user that the path looks sensitive and ask them " +
+		"to handle it manually."
 }
 
 // Category implements tools.Categorized.

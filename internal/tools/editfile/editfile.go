@@ -53,15 +53,26 @@ var _ tools.Tool = (*Tool)(nil)
 // Name implements tools.Tool. Stable — used in tool_calls history.
 func (t *Tool) Name() string { return ToolName }
 
-// Description tells the model the find/replace semantics + the
-// ambiguity contract (multiple matches without replace_all errors out).
+// Description tells the model the find/replace semantics, the ambiguity
+// contract (multiple matches without replace_all errors out), and — by
+// negation — that this tool does NOT create files. This is the model's
+// only authoritative source for edit_file semantics; keep it accurate,
+// since the system prompt no longer carries per-tool sections.
 func (t *Tool) Description() string {
-	return "Edit a file by finding and replacing exact text. " +
-		"old_string must match the file content verbatim (including whitespace). " +
+	return "Modify an EXISTING text file in place by finding and replacing " +
+		"exact text. Provide old_string (exact text to find — must match " +
+		"the file content verbatim, including whitespace) and new_string " +
+		"(replacement text). A fuzzy matcher tolerates minor whitespace " +
+		"and indentation drift, but exact matching is preferred: copy " +
+		"old_string straight from a recent read_file result whenever " +
+		"possible (omit the cat -n line-number prefix). " +
 		"If old_string appears more than once and replace_all is false, " +
 		"the call fails — include more surrounding context in old_string " +
 		"to disambiguate, or set replace_all=true. " +
-		"Returns a diff showing what changed."
+		"Returns a diff showing what changed. " +
+		"REQUIREMENTS: the file must already exist and old_string must be " +
+		"non-empty. To CREATE a new file (or replace one wholesale), use " +
+		"the write_file tool instead — edit_file cannot create files."
 }
 
 // Schema is the JSON Schema for the model's tool-call arguments.

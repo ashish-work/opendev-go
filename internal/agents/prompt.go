@@ -7,57 +7,42 @@ import (
 	"github.com/ashish-work/opendev-go/internal/tools"
 )
 
-// DefaultSystemPrompt is the v1 stable agent prompt. Two-part caching
+// DefaultSystemPrompt is the stable agent prompt. Two-part caching
 // strategy: this entire string is the STABLE half, sent byte-identical
 // on every request so OpenAI's automatic prefix caching can hit. The
 // DYNAMIC half (working directory, time, session id) is intentionally
 // NOT included here — that goes in subsequent message(s) so the cache
 // prefix never shifts.
 //
-// OpenAI auto-caches prefixes ≥1024 tokens. This prompt (~1100 tokens)
-// plus the three tool schemas (~600 tokens) puts the cached prefix
-// well over the threshold. Cache TTL is ~5 minutes; subsequent turns
-// within that window get the cache discount (90% off input cost for
-// the cached portion).
+// Architectural note — single source of truth for tool guidance:
+// per-tool documentation (semantics, gotchas, when-to-use, return-value
+// shape) lives on each tool's Description() method, NOT in this prompt.
+// The model already receives those descriptions in the request's tools
+// array, so duplicating them here only invites drift between prompt and
+// implementation. (We hit exactly that bug in v1 — the prompt claimed
+// edit_file could create files via empty old_string, but the tool
+// rejected that input.) This prompt now carries persona + protocol +
+// working style only; the tools array carries per-tool semantics.
+//
+// OpenAI auto-caches prefixes ≥1024 tokens. This prompt (~750 tokens)
+// plus the four tool schemas with their now-richer descriptions
+// (~150 tokens × 4 = ~600 tokens) puts the cached prefix at ~1350
+// tokens — comfortably over the threshold. Cache TTL is ~5 minutes;
+// subsequent turns within that window get the cache discount (90% off
+// input cost for the cached portion).
 //
 // DO NOT MUTATE THIS AT RUNTIME. Any byte-level change invalidates
 // the cache. If you want dynamic context, add it as a separate
 // message in cmd/opendev — never splice it into this constant.
 const DefaultSystemPrompt = `You are a precise, methodical AI coding assistant operating in a terminal REPL.
-You have access to three tools: bash, read_file, and edit_file.
 
 # Tools
 
-## bash
-Execute shell commands via sh -c. Use bash to inspect the filesystem
-(ls, find, grep, head, tail, wc), run tests, check build status, inspect
-git state, or perform any other shell-based investigation. Combine
-multiple steps with && or ; to minimize round trips. Default timeout is
-60 seconds; specify timeout_sec (up to 600) for longer-running commands.
-
-When bash output exceeds 50 KB or 2000 lines, the full output is saved
-to a file under ~/.opendev/tool-output/ and the response you receive
-includes both a truncated preview and the file path. Use read_file with
-offset and limit on that path to fetch specific sections — never assume
-the preview is the complete result for large outputs.
-
-## read_file
-Read the contents of a text file. Provide an absolute or
-working-directory-relative path. Optional offset (1-indexed line
-number) and limit (max lines) let you read specific sections of large
-files. Output is formatted cat -n style with line numbers; those line
-numbers are visual aids the renderer adds — they are NOT part of the
-file content itself, so don't include them when constructing edit_file
-old_string values.
-
-## edit_file
-Modify a text file in place. Provide old_string (exact text to find)
-and new_string (replacement text). A fuzzy matcher tolerates minor
-whitespace and indentation drift, but exact matching is preferred:
-copy old_string straight from a recent read_file result whenever
-possible. Set replace_all to true to replace every occurrence; default
-replaces only the first match. To create a new file, pass an empty
-old_string and the full file contents as new_string.
+Your available tools are provided as JSON schemas in this request — each
+schema includes the tool's name, parameters, and a description covering
+what it does, when to use it, and any gotchas. Read those descriptions
+as the authoritative reference for tool semantics; the protocol below
+applies on top, to every tool you use.
 
 # Working style
 
