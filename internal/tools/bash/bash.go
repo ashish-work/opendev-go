@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ashishgupta/opendev-go/internal/tools"
+	"github.com/ashishgupta/opendev-go/internal/tools/truncation"
 )
 
 // ToolName is the canonical name the model uses to invoke this tool.
@@ -38,10 +39,6 @@ var (
 	// mode than a falsely-short timeout the model can re-run.
 	maxTimeoutSec = 600 // 10 minutes
 
-	// maxOutputBytes caps combined stdout+stderr per call. Larger output
-	// would dominate the context window; the trailing marker tells the
-	// model the result was truncated.
-	maxOutputBytes = 50 * 1024 // 50 KB
 )
 
 // Tool implements tools.Tool for shell command execution. Stateless,
@@ -63,7 +60,9 @@ func (t *Tool) Description() string {
 	return "Execute a shell command via `sh -c`. Returns combined stdout+stderr. " +
 		"Supports pipes, redirects, env vars, and chained commands (&&, ||, ;). " +
 		"Defaults to a 60-second timeout; specify `timeout_sec` (up to 600) " +
-		"for longer-running commands. Output is truncated at 50 KB."
+		"for longer-running commands. When output exceeds 50 KB or 2000 lines, " +
+		"the full result is saved to a file and the model receives a preview " +
+		"plus the file path — use read_file to view specific sections."
 }
 
 // Schema is the JSON Schema for this tool's parameters, surfaced to the
@@ -125,11 +124,14 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 	cmd.Dir = tctx.WorkingDir
 
 	rawOutput, runErr := cmd.CombinedOutput()
-	output, truncated := truncateOutput(rawOutput)
+	tr := truncation.Truncate(string(rawOutput), 0, 0, truncation.Head)
 
 	meta := map[string]any{
 		"command":          a.Command,
-		"output_truncated": truncated,
+		"output_truncated": tr.Truncated,
+	}
+	if tr.OutputPath != "" {
+		meta["overflow_path"] = tr.OutputPath
 	}
 	if code, ok := exitCodeOf(runErr); ok {
 		meta["exit_code"] = code
@@ -148,7 +150,7 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return tools.ToolResult{
 			Success:  false,
-			Output:   string(output),
+			Output:   tr.Content,
 			Error:    fmt.Sprintf("command timed out after %ds", timeoutSec),
 			Metadata: meta,
 		}, nil
@@ -158,7 +160,7 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 	if runErr != nil {
 		return tools.ToolResult{
 			Success:  false,
-			Output:   string(output),
+			Output:   tr.Content,
 			Error:    runErr.Error(),
 			Metadata: meta,
 		}, nil
@@ -166,26 +168,9 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 
 	return tools.ToolResult{
 		Success:  true,
-		Output:   string(output),
+		Output:   tr.Content,
 		Metadata: meta,
 	}, nil
-}
-
-// truncateOutput caps b at maxOutputBytes, appending a marker when
-// truncation occurred. Returns the (possibly truncated) bytes and the
-// truncation flag.
-//
-// This is the v1 simple cap: it discards everything past the limit.
-// A later commit replaces this with a spillover-to-disk approach so
-// the model can still get at the full output if needed.
-func truncateOutput(b []byte) ([]byte, bool) {
-	if len(b) <= maxOutputBytes {
-		return b, false
-	}
-	out := make([]byte, 0, maxOutputBytes+32)
-	out = append(out, b[:maxOutputBytes]...)
-	out = append(out, []byte("\n...[output truncated]")...)
-	return out, true
 }
 
 // exitCodeOf pulls the OS exit code out of an exec error. Returns

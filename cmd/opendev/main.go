@@ -26,6 +26,7 @@ import (
 	"github.com/ashishgupta/opendev-go/internal/tools/bash"
 	"github.com/ashishgupta/opendev-go/internal/tools/editfile"
 	"github.com/ashishgupta/opendev-go/internal/tools/readfile"
+	"github.com/ashishgupta/opendev-go/internal/tools/truncation"
 	"github.com/ashishgupta/opendev-go/internal/workflow"
 )
 
@@ -58,6 +59,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: get working dir: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Sweep stale overflow files (>7 days) from previous sessions. Cheap;
+	// silent when the dir doesn't exist.
+	truncation.CleanupOldFiles()
 
 	// Wire the closed loop: openai.Client → LlmCaller → ReactLoop.
 	client := openai.NewClient(apiKey)

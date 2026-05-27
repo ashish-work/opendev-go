@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -121,14 +122,15 @@ func TestTimeoutKillsLongCommand(t *testing.T) {
 	}
 }
 
-func TestOutputTruncated(t *testing.T) {
-	prev := maxOutputBytes
-	maxOutputBytes = 100
-	t.Cleanup(func() { maxOutputBytes = prev })
+func TestOutputTruncated_SpillsToFile(t *testing.T) {
+	// Isolate HOME so spillover writes to the test's tmpdir, not the
+	// user's real ~/.opendev/. t.Setenv reverts on test exit.
+	t.Setenv("HOME", t.TempDir())
 
-	// Print 500 chars; truncated to 100 + marker.
+	// 2100 lines is over MaxLines (2000) — forces the truncation
+	// package to spill to disk and return a preview + hint.
 	got, err := run(t, "",
-		args{Command: "printf 'x%.0s' {1..500}"},
+		args{Command: "seq 1 2100"},
 		context.Background())
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -136,12 +138,45 @@ func TestOutputTruncated(t *testing.T) {
 	if !got.Success {
 		t.Fatalf("Success = false: %s", got.Error)
 	}
-	if !strings.Contains(got.Output, "...[output truncated]") {
-		t.Errorf("Output missing truncation marker: %q", got.Output)
+
+	// Preview: should report a line-count truncation + hint.
+	if !strings.Contains(got.Output, "lines truncated") {
+		t.Errorf("Output missing line-truncation marker: %q",
+			truncForLog(got.Output))
+	}
+	if !strings.Contains(got.Output, "Full output saved to:") {
+		t.Errorf("Output missing spillover hint: %q",
+			truncForLog(got.Output))
 	}
 	if got.Metadata["output_truncated"] != true {
 		t.Errorf("output_truncated = %v, want true", got.Metadata["output_truncated"])
 	}
+
+	// Metadata: overflow_path points at the saved file.
+	path, ok := got.Metadata["overflow_path"].(string)
+	if !ok || path == "" {
+		t.Fatalf("overflow_path missing or wrong type: %v",
+			got.Metadata["overflow_path"])
+	}
+
+	// The saved file should contain the FULL original output, so line
+	// "2100" must appear — the preview only has the first 2000.
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read overflow file %q: %v", path, err)
+	}
+	if !strings.Contains(string(content), "2100") {
+		t.Errorf("overflow file missing line 2100; got %d bytes",
+			len(content))
+	}
+}
+
+// truncForLog keeps test failure output readable when Output is large.
+func truncForLog(s string) string {
+	if len(s) <= 200 {
+		return s
+	}
+	return s[:200] + "..."
 }
 
 func TestOuterContextCancellation(t *testing.T) {
