@@ -31,7 +31,7 @@ import (
 )
 
 // Banner shown on startup. Kept short.
-const banner = `opendev v0.1 — type "exit" or Ctrl-D to quit`
+const banner = `opendev v0.2 — type "exit" or Ctrl-D to quit`
 
 // inputBufferSize raises bufio.Scanner's default 64KB cap so long
 // paste-ins (e.g. a stack trace) don't get silently truncated.
@@ -154,9 +154,17 @@ func runTurn(loop *agents.ReactLoop, query string, sigs <-chan os.Signal) (float
 
 	// Status line first, regardless of error path — so the user can
 	// see what was consumed even when the turn failed.
-	fmt.Fprintf(os.Stderr, "[iter=%d in=%d out=%d ctx=%d/%d (%.1f%%) cost=%s]\n",
+	//
+	// in     = cumulative prompt tokens billed this turn (sum across iters)
+	// cached = subset of `in` that hit OpenAI's prefix cache (10% price)
+	// out    = cumulative completion tokens billed this turn
+	// ctx    = calibrator's reported (ground truth) / estimated (with delta)
+	//          / pct of MaxContextTokens
+	// cost   = USD this turn (already discounts cached tokens)
+	fmt.Fprintf(os.Stderr, "[iter=%d in=%d cached=%d out=%d ctx=%d/%d (%.1f%%) cost=%s]\n",
 		tracker.CallCount,
 		tracker.TotalInputTokens,
+		tracker.TotalCacheReadTokens,
 		tracker.TotalOutputTokens,
 		result.Budget.Reported,
 		result.Budget.Estimated,
