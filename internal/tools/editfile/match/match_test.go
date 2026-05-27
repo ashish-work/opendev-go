@@ -90,6 +90,55 @@ func TestLineTrimmedNoMatchWhenContentDiffers(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// similarity / BlockAnchor pass
+// -----------------------------------------------------------------------------
+
+func TestSimilarity(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want float64
+	}{
+		{"", "", 1.0},
+		{"abc", "", 0.0},
+		{"abc", "abc", 1.0},
+		{"abc", "xyz", 0.0},
+	}
+	for _, c := range cases {
+		got := similarity(c.a, c.b)
+		if got != c.want {
+			t.Errorf("similarity(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestBlockAnchorRejectsTooFewLines(t *testing.T) {
+	// Two-line patterns are handled by Simple/LineTrimmed.
+	_, ok := BlockAnchor("a\nb\n", "a\nb")
+	if ok {
+		t.Error("ok = true on 2-line old; want false (BlockAnchor needs ≥3 lines)")
+	}
+}
+
+func TestBlockAnchorMatchesWithDriftedMiddle(t *testing.T) {
+	original := "fn process() {\n    let result = compute(x);\n}\n"
+	old := "fn process() {\n    let result = transform(x);\n}"
+	got, ok := BlockAnchor(original, old)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if !strings.Contains(original, got) {
+		t.Errorf("Actual %q not a substring of original", got)
+	}
+}
+
+func TestBlockAnchorFailsWhenAnchorsAbsent(t *testing.T) {
+	_, ok := BlockAnchor("foo\nbar\nbaz\n", "BEGIN\n  body\nEND")
+	if ok {
+		t.Error("ok = true, want false")
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Find / FindWith dispatch
 // -----------------------------------------------------------------------------
 

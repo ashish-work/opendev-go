@@ -49,6 +49,7 @@ type Result struct {
 var DefaultPasses = []Pass{
 	{Name: "simple", Fn: Simple},
 	{Name: "line_trimmed", Fn: LineTrimmed},
+	{Name: "block_anchor", Fn: BlockAnchor},
 }
 
 // Find runs DefaultPasses on (original, old) and returns the first

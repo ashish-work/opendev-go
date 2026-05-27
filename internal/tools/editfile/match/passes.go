@@ -115,3 +115,190 @@ func LineTrimmed(original, old string) (string, bool) {
 	}
 	return "", false
 }
+
+// -----------------------------------------------------------------------------
+// Pass 3 — BlockAnchor: first/last lines anchor, middle scored by similarity
+// -----------------------------------------------------------------------------
+
+// blockAnchorSimilarityThreshold is the minimum LCS-based ratio
+// required for a candidate to win when more than one (first, last)
+// line pair was found. With exactly one candidate we accept any
+// similarity — the anchors alone are enough disambiguation.
+const blockAnchorSimilarityThreshold = 0.3
+
+// BlockAnchor matches when the first and last lines of `old` (trimmed)
+// pin down a region in `original`, even if the middle lines drifted.
+// Useful when the model paraphrased the body but got the boundaries
+// right (a surprisingly common LLM mode).
+//
+// Requires at least 3 lines (first + middle + last) — single- and
+// two-line patterns are handled by Simple/LineTrimmed.
+//
+// Strategy:
+//  1. Trim the first and last lines of `old` — these become the anchors.
+//  2. Scan `original` for line pairs where line[i].trim() == firstAnchor
+//     AND line[j].trim() == lastAnchor, with j sized roughly like
+//     len(old) (search window is 2× the expected length).
+//  3. For each candidate (i, j), score the middle by LCS-based
+//     similarity vs `old`'s middle.
+//  4. With one candidate, threshold drops to 0.0 (anchors alone are
+//     enough). With multiple candidates, similarity ≥ 0.3 wins.
+//
+// Example (model paraphrased the middle):
+//
+//	original: "fn process() {\n    let result = compute(x);\n}\n"
+//	old:      "fn process() {\n    let result = transform(x);\n}"
+//	              ^anchor1                ^drift                  ^anchor2
+//
+//	First anchor "fn process() {" matches at line 0.
+//	Last anchor "}" matches at line 2.
+//	Middle similarity ≈ 0.85 (most chars overlap between "compute" and "transform").
+//	Single candidate → threshold 0.0 → match wins.
+//	→ ("fn process() {\n    let result = compute(x);\n}", true)
+//
+// Example (rejected — anchors absent):
+//
+//	original: "foo\nbar\nbaz\n"
+//	old:      "BEGIN\n  body\nEND"
+//	→ ("", false)    // no line trims to "BEGIN"
+func BlockAnchor(original, old string) (string, bool) {
+	oldLines := strings.Split(old, "\n")
+	if len(oldLines) < 3 {
+		return "", false
+	}
+
+	firstTrimmed := strings.TrimSpace(oldLines[0])
+	lastTrimmed := strings.TrimSpace(oldLines[len(oldLines)-1])
+
+	middleOld := make([]string, 0, len(oldLines)-2)
+	for _, l := range oldLines[1 : len(oldLines)-1] {
+		middleOld = append(middleOld, strings.TrimSpace(l))
+	}
+
+	originalLines := strings.Split(original, "\n")
+
+	type candidate struct {
+		start, end int
+		sim        float64
+	}
+	var candidates []candidate
+
+	for i := 0; i < len(originalLines); i++ {
+		if strings.TrimSpace(originalLines[i]) != firstTrimmed {
+			continue
+		}
+		// Search a window of 2× the expected length for the closing
+		// anchor. 2× tolerates middle lines drifting modestly in count.
+		windowEnd := i + len(oldLines)*2
+		if windowEnd > len(originalLines) {
+			windowEnd = len(originalLines)
+		}
+		for endIdx := i + len(oldLines) - 1; endIdx < windowEnd; endIdx++ {
+			if endIdx >= len(originalLines) {
+				break
+			}
+			if strings.TrimSpace(originalLines[endIdx]) != lastTrimmed {
+				continue
+			}
+			middleOrig := make([]string, 0, endIdx-i-1)
+			for _, l := range originalLines[i+1 : endIdx] {
+				middleOrig = append(middleOrig, strings.TrimSpace(l))
+			}
+
+			var sim float64
+			switch {
+			case len(middleOld) == 0 && len(middleOrig) == 0:
+				sim = 1.0
+			case len(middleOld) == 0 || len(middleOrig) == 0:
+				continue
+			default:
+				sim = similarity(strings.Join(middleOld, "\n"), strings.Join(middleOrig, "\n"))
+			}
+			candidates = append(candidates, candidate{start: i, end: endIdx, sim: sim})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "", false
+	}
+
+	threshold := blockAnchorSimilarityThreshold
+	if len(candidates) == 1 {
+		threshold = 0.0
+	}
+
+	bestIdx := 0
+	for i := 1; i < len(candidates); i++ {
+		if candidates[i].sim > candidates[bestIdx].sim {
+			bestIdx = i
+		}
+	}
+	if candidates[bestIdx].sim < threshold {
+		return "", false
+	}
+
+	best := candidates[bestIdx]
+	actual := strings.Join(originalLines[best.start:best.end+1], "\n")
+	if strings.Contains(original, actual) {
+		return actual, true
+	}
+	return "", false
+}
+
+// similarity returns a ratio in [0, 1] equal to 2*|LCS(a,b)| / (|a|+|b|),
+// the same shape as Python's difflib.SequenceMatcher.ratio(). 1.0 means
+// identical, 0.0 means no common substring. Operates on bytes (not
+// runes) — fine because we apply it to trimmed code where ASCII
+// dominates and a few multi-byte chars don't shift the score meaningfully.
+//
+// Examples:
+//
+//	similarity("",      "")      = 1.0   // both empty → identical
+//	similarity("abc",   "")      = 0.0   // one empty → no overlap
+//	similarity("abc",   "abc")   = 1.0   // identical
+//	similarity("abc",   "xyz")   = 0.0   // LCS = "" → 0 / 6 = 0
+//	similarity("abcdef","abcxyz")= 0.5   // LCS = "abc" (3) → 2*3 / (6+6) = 0.5
+//	similarity("kitten","sitting")≈ 0.61 // LCS = "ittn" (4) → 8 / 13 ≈ 0.615
+func similarity(a, b string) float64 {
+	switch {
+	case a == "" && b == "":
+		return 1.0
+	case a == "" || b == "":
+		return 0.0
+	}
+	ab := []byte(a)
+	bb := []byte(b)
+	lcs := lcsLength(ab, bb)
+	return 2.0 * float64(lcs) / float64(len(ab)+len(bb))
+}
+
+// lcsLength is the length of the longest common subsequence of a and b,
+// computed with O(n) extra memory (two rolling rows instead of a full
+// m×n table).
+func lcsLength(a, b []byte) int {
+	m, n := len(a), len(b)
+	prev := make([]int, n+1)
+	curr := make([]int, n+1)
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			if a[i-1] == b[j-1] {
+				curr[j] = prev[j-1] + 1
+			} else if curr[j-1] > prev[j] {
+				curr[j] = curr[j-1]
+			} else {
+				curr[j] = prev[j]
+			}
+		}
+		prev, curr = curr, prev
+		for k := range curr {
+			curr[k] = 0
+		}
+	}
+	best := 0
+	for _, v := range prev {
+		if v > best {
+			best = v
+		}
+	}
+	return best
+}
