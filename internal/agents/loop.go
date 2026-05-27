@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/ashishgupta/opendev-go/internal/budget"
 	"github.com/ashishgupta/opendev-go/internal/cost"
 	"github.com/ashishgupta/opendev-go/internal/provider"
 	"github.com/ashishgupta/opendev-go/internal/tools"
@@ -35,6 +36,11 @@ type Config struct {
 	// Empty means "no working dir" — tools that resolve relative paths
 	// will treat paths as absolute.
 	WorkingDir string
+
+	// MaxContextTokens is the model's context-window cap used by the
+	// budget calibrator. Zero disables usage-percent math but the
+	// calibrator still tracks reported and estimated counts.
+	MaxContextTokens int
 }
 
 // ReactLoop is the v1 single-phase agent loop. The flow each iteration:
@@ -87,7 +93,15 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 		UserMessage(userTask),
 	}
 	tracker := cost.Tracker{}
+	cal := budget.New(l.Config.MaxContextTokens)
 	tctx := tools.ToolContext{WorkingDir: l.Config.WorkingDir}
+
+	// snapshot builds the Result.Budget for any return path. The
+	// `history` slice is captured by reference, so the snapshot
+	// reflects whatever was in history at the point of return.
+	snapshot := func() budget.Snapshot {
+		return cal.Snapshot(history, l.Config.SystemPrompt)
+	}
 
 	for iter := 1; iter <= l.Config.MaxIterations; iter++ {
 		// Ctx check at iteration top — catches cancellations between
@@ -96,9 +110,15 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 			return Result{
 					Messages:    history,
 					Interrupted: true,
+					Budget:      snapshot(),
 				}, tracker,
 				fmt.Errorf("%w: iter %d: %v", ErrInterrupted, iter, err)
 		}
+
+		// Snapshot the request-side message count BEFORE the call —
+		// that's what apiPromptTokens will refer to once the response
+		// comes back. (Assistant reply gets appended after.)
+		msgCountAtRequest := len(history)
 
 		req := provider.Request{
 			Model:    l.Config.Workflow.Resolve(workflow.SlotExecution).Model,
@@ -109,9 +129,13 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 		resp, newTracker, err := l.Caller.Call(ctx, req, tracker)
 		tracker = newTracker
 		if err != nil {
-			return Result{Messages: history}, tracker,
+			return Result{Messages: history, Budget: snapshot()}, tracker,
 				fmt.Errorf("%w: %v", ErrLLM, err)
 		}
+
+		// Calibrate against the provider's authoritative count for the
+		// messages it just saw.
+		cal = cal.Update(resp.Usage.PromptTokens, msgCountAtRequest)
 
 		// Append the assistant's response to history regardless of
 		// whether it's a final answer or a tool-call turn.
@@ -132,6 +156,7 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 				Content:  resp.Content,
 				Success:  true,
 				Messages: history,
+				Budget:   snapshot(),
 			}, tracker, nil
 		}
 
@@ -145,7 +170,7 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 				ctx, tctx, call.Name, ensureJSON(call.Arguments),
 			)
 			if dispatchErr != nil {
-				return Result{Messages: history}, tracker,
+				return Result{Messages: history, Budget: snapshot()}, tracker,
 					fmt.Errorf("%w: %s: %v", ErrToolExec, call.Name, dispatchErr)
 			}
 			history = append(history, ToolResultMessage(call.ID, call.Name, result))
@@ -154,6 +179,6 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 
 	// Loop hit its iteration cap. Return the partial Result so callers
 	// can show the user what was happening up to the cap.
-	return Result{Messages: history}, tracker,
+	return Result{Messages: history, Budget: snapshot()}, tracker,
 		fmt.Errorf("%w (limit=%d)", ErrMaxIterations, l.Config.MaxIterations)
 }

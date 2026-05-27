@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/ashishgupta/opendev-go/internal/budget"
 	"github.com/ashishgupta/opendev-go/internal/provider"
 )
 
@@ -165,6 +166,12 @@ type Result struct {
 	// for persisting to session storage or replaying. Includes system
 	// prompt, user input, all assistant turns, and all tool results.
 	Messages []provider.Message
+
+	// Budget — the context-window fill picture at end-of-run. Reported
+	// is the last value the provider returned; Estimated is the local
+	// extrapolation including any messages added after that report.
+	// Both are zero before the first LLM call completes.
+	Budget budget.Snapshot
 
 	// PartialResult — deferred. Will land with the interrupt-mid-
 	// execution recovery feature so partial work can be preserved

@@ -46,6 +46,8 @@ func main() {
 		"Override the default system prompt. Empty uses the built-in default.")
 	baseURL := flag.String("base-url", openai.DefaultBaseURL,
 		"Provider base URL (override for proxies / OpenAI-compatible servers).")
+	maxContext := flag.Int("max-context", 128_000,
+		"Context-window cap in tokens (for budget calibration). 0 disables the usage percentage.")
 	flag.Parse()
 
 	apiKey := os.Getenv("OPENAI_API_KEY")
@@ -78,9 +80,10 @@ func main() {
 		Workflow: workflow.Config{
 			Execution: workflow.SlotConfig{Model: *model},
 		},
-		MaxIterations: *maxIter,
-		SystemPrompt:  *systemPrompt,
-		WorkingDir:    workingDir,
+		MaxIterations:    *maxIter,
+		SystemPrompt:     *systemPrompt,
+		WorkingDir:       workingDir,
+		MaxContextTokens: *maxContext,
 	})
 
 	// Persistent total across REPL turns so the final goodbye can show
@@ -151,10 +154,13 @@ func runTurn(loop *agents.ReactLoop, query string, sigs <-chan os.Signal) (float
 
 	// Status line first, regardless of error path — so the user can
 	// see what was consumed even when the turn failed.
-	fmt.Fprintf(os.Stderr, "[iter=%d in=%d out=%d cost=%s]\n",
+	fmt.Fprintf(os.Stderr, "[iter=%d in=%d out=%d ctx=%d/%d (%.1f%%) cost=%s]\n",
 		tracker.CallCount,
 		tracker.TotalInputTokens,
 		tracker.TotalOutputTokens,
+		result.Budget.Reported,
+		result.Budget.Estimated,
+		result.Budget.UsagePct*100,
 		tracker.FormatCost(),
 	)
 

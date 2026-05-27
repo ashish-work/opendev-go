@@ -356,6 +356,67 @@ func TestNewReactLoopDefaults(t *testing.T) {
 	}
 }
 
+func TestBudgetSnapshotInResult(t *testing.T) {
+	// Two-turn run: provider reports 100 tokens turn 1, 250 turn 2.
+	// Result.Budget should reflect the LAST reported value (250), not
+	// the sum — Reported is meant to be the most recent ground-truth
+	// anchor, not a cumulative total (that's TotalInputTokens).
+	tool := echoTool("noop")
+	p := &fakeProvider{
+		responses: []provider.Response{
+			{ToolCalls: []provider.ToolCall{
+				{ID: "1", Name: "noop", Arguments: json.RawMessage(`{}`)},
+			}, Usage: provider.Usage{PromptTokens: 100, CompletionTokens: 20}},
+			{Content: "done", FinishReason: "stop",
+				Usage: provider.Usage{PromptTokens: 250, CompletionTokens: 10}},
+		},
+	}
+	reg := tools.NewRegistry()
+	if err := reg.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	caller := NewLlmCaller(p, cost.Pricing{})
+	loop := NewReactLoop(caller, reg, Config{
+		Workflow:         workflow.Config{Execution: workflow.SlotConfig{Model: "test"}},
+		MaxContextTokens: 10_000,
+	})
+
+	result, _, err := loop.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Budget.Reported != 250 {
+		t.Errorf("Budget.Reported = %d, want 250 (last turn's value)",
+			result.Budget.Reported)
+	}
+	if result.Budget.Estimated < 250 {
+		t.Errorf("Budget.Estimated = %d, want >= 250 (baseline + local delta)",
+			result.Budget.Estimated)
+	}
+	if result.Budget.UsagePct != 0.025 {
+		t.Errorf("Budget.UsagePct = %v, want 0.025 (250/10000)",
+			result.Budget.UsagePct)
+	}
+}
+
+func TestBudgetUntouchedWithoutLLMCall(t *testing.T) {
+	// Pre-cancelled ctx → loop exits before any LLM call → Budget
+	// is the zero snapshot. Guards against panics on the error path.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p := &fakeProvider{responses: []provider.Response{{Content: "x"}}}
+	loop := newLoop(t, p, nil)
+
+	result, _, err := loop.Run(ctx, "go")
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("err = %v, want ErrInterrupted", err)
+	}
+	if result.Budget.Reported != 0 {
+		t.Errorf("Budget.Reported = %d, want 0 (no call made)",
+			result.Budget.Reported)
+	}
+}
+
 func TestSchemasForReturnsSortedToolList(t *testing.T) {
 	reg := tools.NewRegistry()
 	for _, name := range []string{"zebra", "apple", "mango"} {
