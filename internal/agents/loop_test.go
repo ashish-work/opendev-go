@@ -186,17 +186,18 @@ func TestMultipleToolCallsInOneTurn(t *testing.T) {
 
 func TestMaxIterations(t *testing.T) {
 	// Provider always returns a tool call → loop runs forever (until cap).
+	// Vary the args per turn so the doom-loop detector doesn't fire
+	// before the iteration cap does — this test is specifically
+	// exercising MaxIterations, not doom-loop detection.
 	tool := echoTool("noop")
-	loopingResponse := provider.Response{
-		ToolCalls: []provider.ToolCall{
-			{ID: "x", Name: "noop", Arguments: json.RawMessage(`{}`)},
-		},
-		FinishReason: "tool_calls",
-	}
-	// Build 100 identical responses (more than the cap).
 	responses := make([]provider.Response, 100)
 	for i := range responses {
-		responses[i] = loopingResponse
+		responses[i] = provider.Response{
+			ToolCalls: []provider.ToolCall{
+				{ID: "x", Name: "noop", Arguments: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i))},
+			},
+			FinishReason: "tool_calls",
+		}
 	}
 	p := &fakeProvider{responses: responses}
 
@@ -414,6 +415,69 @@ func TestBudgetUntouchedWithoutLLMCall(t *testing.T) {
 	if result.Budget.Reported != 0 {
 		t.Errorf("Budget.Reported = %d, want 0 (no call made)",
 			result.Budget.Reported)
+	}
+}
+
+func TestDoomLoop_HaltsAfterThirdEscalation(t *testing.T) {
+	// Provider hammers the same tool with the same args. Detector
+	// fires Redirect on call 3, Notify on call 4, ForceStop on call 5.
+	identical := provider.Response{
+		ToolCalls: []provider.ToolCall{
+			{ID: "x", Name: "noop", Arguments: json.RawMessage(`{"k":"v"}`)},
+		},
+		FinishReason: "tool_calls",
+	}
+	responses := make([]provider.Response, 20)
+	for i := range responses {
+		responses[i] = identical
+	}
+	p := &fakeProvider{responses: responses}
+	loop := newLoop(t, p, []tools.Tool{echoTool("noop")})
+
+	_, _, err := loop.Run(context.Background(), "go")
+	if !errors.Is(err, ErrDoomLoop) {
+		t.Fatalf("err = %v, want wraps ErrDoomLoop", err)
+	}
+	if p.calls != 5 {
+		t.Errorf("provider calls = %d, want 5", p.calls)
+	}
+}
+
+func TestDoomLoop_RedirectDoesNotHaltDispatch(t *testing.T) {
+	// 3 identical calls → Redirect. The loop should INJECT a warning
+	// system message and continue dispatching the tools. The 4th
+	// response is a clean Content to let the loop finish cleanly.
+	identical := provider.Response{
+		ToolCalls: []provider.ToolCall{
+			{ID: "x", Name: "noop", Arguments: json.RawMessage(`{"k":"v"}`)},
+		},
+		FinishReason: "tool_calls",
+	}
+	p := &fakeProvider{
+		responses: []provider.Response{
+			identical, identical, identical,
+			{Content: "ok", FinishReason: "stop"},
+		},
+	}
+	loop := newLoop(t, p, []tools.Tool{echoTool("noop")})
+
+	result, _, err := loop.Run(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !result.Success {
+		t.Error("Success = false, want true (Redirect should not halt)")
+	}
+	found := false
+	for _, m := range result.Messages {
+		if m.Role == "system" && len(m.Content) > 0 &&
+			strings.Contains(m.Content[0].Text, "stuck") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("history missing doom-loop warning system message")
 	}
 }
 

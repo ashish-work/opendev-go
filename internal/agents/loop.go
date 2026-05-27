@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/ashishgupta/opendev-go/internal/agents/doomloop"
 	"github.com/ashishgupta/opendev-go/internal/budget"
 	"github.com/ashishgupta/opendev-go/internal/cost"
 	"github.com/ashishgupta/opendev-go/internal/provider"
@@ -94,6 +95,7 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 	}
 	tracker := cost.Tracker{}
 	cal := budget.New(l.Config.MaxContextTokens)
+	detector := doomloop.New()
 	tctx := tools.ToolContext{WorkingDir: l.Config.WorkingDir}
 
 	// snapshot builds the Result.Budget for any return path. The
@@ -158,6 +160,18 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 				Messages: history,
 				Budget:   snapshot(),
 			}, tracker, nil
+		}
+
+		// Doom-loop check: fingerprint the proposed tool calls and
+		// look for repeating cycles. ForceStop halts before dispatch;
+		// Redirect/Notify inject guidance and let dispatch continue.
+		switch action, warning, recovery := detector.Check(resp.ToolCalls); action {
+		case doomloop.ForceStop:
+			history = append(history, SystemMessage(warning))
+			return Result{Messages: history, Budget: snapshot()}, tracker,
+				fmt.Errorf("%w: %s", ErrDoomLoop, warning)
+		case doomloop.Redirect, doomloop.Notify:
+			history = append(history, SystemMessage(warning+"\n\n"+recovery))
 		}
 
 		// Dispatch each tool call in order. Tool-domain failures

@@ -110,6 +110,11 @@ var (
 	// ErrInterrupted — the loop exited because ctx was cancelled
 	// (user pressed Ctrl-C, timeout fired, etc.).
 	ErrInterrupted = errors.New("interrupted by user")
+
+	// ErrDoomLoop — the doomloop detector escalated to ForceStop
+	// because the model called the same tool(s) in a tight cycle.
+	// Callers should NOT auto-retry; the user needs to rephrase.
+	ErrDoomLoop = errors.New("doom loop detected")
 )
 
 // APIError carries a structured HTTP error from the provider — status
