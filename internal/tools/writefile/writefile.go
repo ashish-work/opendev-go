@@ -24,6 +24,7 @@ import (
 
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/tools/filelock"
+	"github.com/ashish-work/opendev-go/internal/tools/pathutil"
 )
 
 // ToolName is the canonical name the model uses to invoke this tool.
@@ -108,6 +109,19 @@ func (t *Tool) Execute(ctx context.Context, tctx tools.ToolContext, raw json.Raw
 	}
 	if len(a.Content) > maxContentSize {
 		return failf("content too large: %d bytes (max %d)", len(a.Content), maxContentSize), nil
+	}
+
+	// Refuse paths that look like credential/secret files. Detection
+	// is filename-based and case-insensitive — id_rsa is treated as
+	// a private key whether it sits in ~/.ssh/ or /tmp/. Runs BEFORE
+	// any disk work so the file isn't created when the refusal
+	// triggers on a path that doesn't yet exist.
+	if reason := pathutil.SensitiveReason(a.FilePath); reason != "" {
+		return failf(
+			"refusing to write to %s: %s — this file likely contains secrets. "+
+				"If you really need to modify it, edit it manually.",
+			a.FilePath, reason,
+		), nil
 	}
 
 	createDirs := true

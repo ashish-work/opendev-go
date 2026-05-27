@@ -287,6 +287,69 @@ func TestTool_Execute(t *testing.T) {
 			t.Errorf("Error = %q, want invalid arguments", res.Error)
 		}
 	})
+
+	// Sensitive-path refusal cases. The point is to verify the refusal
+	// triggers BEFORE any disk work — none of these files should exist
+	// after the call, and the model should get a clear refusal message
+	// to relay back to the user.
+	sensitive := []struct {
+		name      string
+		basename  string
+		mustMatch string // substring required in the error message
+	}{
+		{"dot-env", ".env", "environment"},
+		{"id_rsa", "id_rsa", "private key"},
+		{"server pem", "server.pem", "private key"},
+		{"npmrc", ".npmrc", "credentials"},
+		{"app secret json", "app-secret.json", "secrets"},
+	}
+	for _, tc := range sensitive {
+		t.Run("refuses "+tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, tc.basename)
+			res, err := tool.Execute(ctx, tools.ToolContext{}, mkArgs(t, map[string]any{
+				"file_path": path,
+				"content":   "should never be written",
+			}))
+			if err != nil {
+				t.Fatalf("Execute err: %v", err)
+			}
+			if res.Success {
+				t.Fatalf("expected Success=false for sensitive path %q", path)
+			}
+			if !strings.Contains(res.Error, "refusing to write") {
+				t.Errorf("Error = %q, want refusal framing", res.Error)
+			}
+			if !strings.Contains(res.Error, tc.mustMatch) {
+				t.Errorf("Error = %q, want it to mention %q", res.Error, tc.mustMatch)
+			}
+			if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("file should NOT exist after refusal")
+			}
+		})
+	}
+
+	t.Run(".env.example is still allowed", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, ".env.example")
+		res, err := tool.Execute(ctx, tools.ToolContext{}, mkArgs(t, map[string]any{
+			"file_path": path,
+			"content":   "API_KEY=your-key-here\n",
+		}))
+		if err != nil {
+			t.Fatalf("Execute err: %v", err)
+		}
+		if !res.Success {
+			t.Fatalf("Success=false; Error=%q — .env.example should be writeable", res.Error)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if string(got) != "API_KEY=your-key-here\n" {
+			t.Errorf("content = %q, want the placeholder content", got)
+		}
+	})
 }
 
 // TestSharedLockSerializesConcurrentWrites checks that the per-file
