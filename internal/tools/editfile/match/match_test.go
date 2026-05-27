@@ -271,6 +271,46 @@ func TestContextAwareRejectsSingleLineOld(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// MultiOccurrence pass
+// -----------------------------------------------------------------------------
+
+func TestMultiOccurrenceOuterTrimAndPerLineTrim(t *testing.T) {
+	original := "    line1\n    line2\n    line3\n"
+	old := "\n\n  line1\n  line2\n  line3\n\n"
+	got, ok := MultiOccurrence(original, old)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if !strings.Contains(original, got) {
+		t.Errorf("Actual %q not a substring of original", got)
+	}
+}
+
+func TestMultiOccurrenceRejectsEmptyAfterTrim(t *testing.T) {
+	_, ok := MultiOccurrence("anything\n", "\n\n\n")
+	if ok {
+		t.Error("ok = true, want false")
+	}
+}
+
+func TestAllNinePassesRegistered(t *testing.T) {
+	want := []string{
+		"simple", "line_trimmed", "block_anchor",
+		"whitespace_normalized", "indentation_flexible",
+		"escape_normalized", "trimmed_boundary",
+		"context_aware", "multi_occurrence",
+	}
+	if len(DefaultPasses) != len(want) {
+		t.Fatalf("len(DefaultPasses) = %d, want %d", len(DefaultPasses), len(want))
+	}
+	for i, p := range DefaultPasses {
+		if p.Name != want[i] {
+			t.Errorf("DefaultPasses[%d].Name = %q, want %q", i, p.Name, want[i])
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Find / FindWith dispatch
 // -----------------------------------------------------------------------------
 

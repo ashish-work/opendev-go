@@ -730,3 +730,72 @@ func ContextAware(original, old string) (string, bool) {
 	}
 	return "", false
 }
+
+// -----------------------------------------------------------------------------
+// Pass 9 — MultiOccurrence: last-resort outer-trim + per-line trim compare
+// -----------------------------------------------------------------------------
+
+// MultiOccurrence is the last-resort fallback. Trim the WHOLE `old`
+// (drops outer whitespace + blanks), split into lines, then do a
+// strict line-by-line trimmed comparison against every starting
+// position in `original`.
+//
+// This is essentially "LineTrimmed after outer trim" — useful when
+// the model wrapped its `old` content in extra blank lines that
+// LineTrimmed itself can't strip (LineTrimmed trims per-line, not
+// outer).
+//
+// Strategy:
+//  1. trim(old). Empty → skip.
+//  2. Split into lines.
+//  3. For each starting position i where i + N fits, compare each of
+//     the next N trimmed file lines to the N trimmed old lines.
+//  4. On match, return the UN-trimmed file slice.
+//
+// Example:
+//
+//	original: "    line1\n    line2\n    line3\n"
+//	old:      "\n\n  line1\n  line2\n  line3\n\n"
+//
+//	trim(old) = "line1\n  line2\n  line3"
+//	  (outer newlines + outer "  " gone, INTERIOR per-line indent stays)
+//	per-line trimmed:        ["line1", "line2", "line3"]
+//	per-line trimmed of file: ["line1", "line2", "line3", ""]
+//	                                   ^ all 3 match at offset 0
+//
+//	→ ("    line1\n    line2\n    line3", true)
+//
+// Example (rejected — empty after outer trim):
+//
+//	old: "\n\n\n"
+//	→ ("", false)
+func MultiOccurrence(original, old string) (string, bool) {
+	trimmed := strings.TrimSpace(old)
+	if trimmed == "" {
+		return "", false
+	}
+
+	originalLines := strings.Split(original, "\n")
+	trimmedLines := strings.Split(trimmed, "\n")
+
+	if len(trimmedLines) > len(originalLines) {
+		return "", false
+	}
+
+	for i := 0; i <= len(originalLines)-len(trimmedLines); i++ {
+		allMatch := true
+		for k, ol := range trimmedLines {
+			if strings.TrimSpace(originalLines[i+k]) != strings.TrimSpace(ol) {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			candidate := strings.Join(originalLines[i:i+len(trimmedLines)], "\n")
+			if strings.Contains(original, candidate) {
+				return candidate, true
+			}
+		}
+	}
+	return "", false
+}

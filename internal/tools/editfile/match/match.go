@@ -55,6 +55,7 @@ var DefaultPasses = []Pass{
 	{Name: "escape_normalized", Fn: EscapeNormalized},
 	{Name: "trimmed_boundary", Fn: TrimmedBoundary},
 	{Name: "context_aware", Fn: ContextAware},
+	{Name: "multi_occurrence", Fn: MultiOccurrence},
 }
 
 // Find runs DefaultPasses on (original, old) and returns the first
