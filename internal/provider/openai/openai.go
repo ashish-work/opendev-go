@@ -57,6 +57,24 @@ func (a Adapter) ChatCompletionsURL() string {
 // Chat Completions JSON payload. The output is ready to POST as the
 // request body.
 func (a Adapter) BuildRequest(req provider.Request) ([]byte, error) {
+	return json.Marshal(buildPayload(req, false))
+}
+
+// BuildStreamRequest is the streaming twin of BuildRequest. Same payload
+// plus "stream": true and "stream_options": {"include_usage": true} so
+// the server emits a final usage chunk we can fold into Response.Usage.
+// Separate method rather than a flag on BuildRequest so callers state
+// their intent at the call site and the two paths can't accidentally
+// swap.
+func (a Adapter) BuildStreamRequest(req provider.Request) ([]byte, error) {
+	return json.Marshal(buildPayload(req, true))
+}
+
+// buildPayload is the shared body of BuildRequest and BuildStreamRequest.
+// Returns a fresh map per call so callers can't mutate each other's
+// state — matches the immutability rule used everywhere else in this
+// codebase.
+func buildPayload(req provider.Request, stream bool) map[string]any {
 	payload := map[string]any{
 		"model":    req.Model,
 		"messages": convertMessages(req.Messages),
@@ -64,7 +82,14 @@ func (a Adapter) BuildRequest(req provider.Request) ([]byte, error) {
 	if len(req.Tools) > 0 {
 		payload["tools"] = convertTools(req.Tools)
 	}
-	return json.Marshal(payload)
+	if stream {
+		payload["stream"] = true
+		// include_usage asks the server for a final chunk containing
+		// token counts; without it the usage object is absent from
+		// every chunk and cost tracking goes blind on streamed calls.
+		payload["stream_options"] = map[string]any{"include_usage": true}
+	}
+	return payload
 }
 
 // convertMessages translates normalized Messages into the OpenAI Chat
