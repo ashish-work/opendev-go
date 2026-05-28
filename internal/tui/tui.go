@@ -34,6 +34,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ashish-work/opendev-go/internal/agents"
+	"github.com/ashish-work/opendev-go/internal/budget"
+	"github.com/ashish-work/opendev-go/internal/cost"
 	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
@@ -102,13 +104,30 @@ type model struct {
 	// quitting flips true when a global-quit key arrives; View
 	// returns "" to let the alt screen clean up.
 	quitting bool
+
+	// modelName is the model identifier the binary launched against
+	// (e.g. "gpt-4o-mini"). Stable for the session; surfaced in the
+	// status bar.
+	modelName string
+
+	// tracker accumulates cost/token totals across every turn this
+	// session. The agent loop returns a FRESH tracker per turn; we
+	// fold each turn's tracker into m.tracker so the status bar
+	// shows cumulative session totals instead of per-turn values.
+	tracker cost.Tracker
+
+	// lastBudget is the most recent context-window snapshot,
+	// captured from each turn's Result.Budget. Drives the "ctx N.N%"
+	// display on the status bar.
+	lastBudget budget.Snapshot
 }
 
-// initialModel constructs the starting state with both widgets ready
-// and the agent loop attached. Dimensions are zero until the first
-// tea.WindowSizeMsg arrives — that happens immediately on program
-// start, so the user never sees a zero-sized panel.
-func initialModel(loop *agents.ReactLoop) model {
+// initialModel constructs the starting state with both widgets ready,
+// the agent loop attached, and the model name stashed for the status
+// bar. Dimensions are zero until the first tea.WindowSizeMsg arrives
+// — that happens immediately on program start, so the user never
+// sees a zero-sized panel.
+func initialModel(loop *agents.ReactLoop, modelName string) model {
 	ta := textarea.New()
 	ta.Placeholder = "Type — Ctrl-D submit · Ctrl-T toggle tool details · PgUp/PgDn scroll · Ctrl-C cancel/quit"
 	ta.CharLimit = 0 // unlimited; we cap effective size via the agent's token budget
@@ -118,9 +137,10 @@ func initialModel(loop *agents.ReactLoop) model {
 	vp := viewport.New(0, 0) // sized properly on first WindowSizeMsg
 
 	return model{
-		textarea: ta,
-		viewport: vp,
-		loop:     loop,
+		textarea:  ta,
+		viewport:  vp,
+		loop:      loop,
+		modelName: modelName,
 	}
 }
 
@@ -150,9 +170,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Re-size widgets. textarea uses SetWidth (pointer-receiver
 		// method that recomputes wrap), viewport sizes via fields.
+		// Viewport height carves out the status bar (1 row),
+		// divider (1 row), and textarea (5 rows) from the total
+		// terminal height.
 		m.textarea.SetWidth(m.width)
 		m.viewport.Width = m.width
-		m.viewport.Height = max(0, m.height-inputHeight-dividerHeight)
+		m.viewport.Height = max(0, m.height-statusBarHeight-inputHeight-dividerHeight)
 
 		// Re-flow viewport content because width changed.
 		m.viewport.SetContent(m.renderHistory())
@@ -251,6 +274,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.thinking = false
 		m.turnCancel = nil
 
+		// Fold the per-turn tracker into the session tracker so the
+		// status bar shows CUMULATIVE totals (each loop.Run returns
+		// a fresh tracker holding only that turn's data). BudgetUSD
+		// is per-session config, not a sum, so we preserve the
+		// existing value rather than adding.
+		m.tracker.TotalInputTokens += msg.tracker.TotalInputTokens
+		m.tracker.TotalOutputTokens += msg.tracker.TotalOutputTokens
+		m.tracker.TotalCacheReadTokens += msg.tracker.TotalCacheReadTokens
+		m.tracker.TotalCostUSD += msg.tracker.TotalCostUSD
+		m.tracker.CallCount += msg.tracker.CallCount
+
+		// The latest Budget snapshot is the freshest read on
+		// context-window load; status bar wants that, not an
+		// accumulated value.
+		m.lastBudget = msg.result.Budget
+
 		switch {
 		case msg.err == nil:
 			// Success path: replace history with the agent's full
@@ -340,8 +379,9 @@ func appendOrReplaceHistory(existing []viewMessage, loopMsgs []provider.Message)
 }
 
 // View renders the current model to a string. lipgloss.JoinVertical
-// stacks the viewport, divider, and textarea with left-alignment.
-// Bubble Tea diffs the previous frame and only repaints what changed.
+// stacks the status bar, viewport, divider, and textarea with left
+// alignment. Bubble Tea diffs the previous frame and only repaints
+// what changed.
 func (m model) View() string {
 	if m.quitting {
 		return ""
@@ -352,9 +392,15 @@ func (m model) View() string {
 		// screen isn't blank.
 		return "opendev-tui starting..."
 	}
+	status := renderStatus(m.width, statusState{
+		modelName: m.modelName,
+		tracker:   m.tracker,
+		budget:    m.lastBudget,
+	})
 	divider := dividerStyle.Render(strings.Repeat("─", m.width))
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
+		status,
 		m.viewport.View(),
 		divider,
 		m.textarea.View(),
@@ -396,8 +442,13 @@ func max(a, b int) int {
 // crashed. The loop must be fully constructed — Provider, registry,
 // workflow config — before Run is called; the TUI owns no
 // dependency wiring of its own.
-func Run(loop *agents.ReactLoop) error {
-	p := tea.NewProgram(initialModel(loop), tea.WithAltScreen())
+//
+// modelName is shown in the status bar. It's passed in (rather than
+// pulled from loop.Config.Workflow) so the binary stays the single
+// source of truth for its own configuration, and so the TUI doesn't
+// need a getter on the v1 ReactLoop type just for display purposes.
+func Run(loop *agents.ReactLoop, modelName string) error {
+	p := tea.NewProgram(initialModel(loop, modelName), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }

@@ -88,7 +88,7 @@ func main() {
 		MaxContextTokens: *maxContext,
 	})
 
-	if err := tui.Run(loop); err != nil {
+	if err := tui.Run(loop, *model); err != nil {
 		fmt.Fprintln(os.Stderr, "opendev-tui:", err)
 		os.Exit(1)
 	}

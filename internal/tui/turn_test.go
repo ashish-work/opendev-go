@@ -110,7 +110,7 @@ func TestRunTurnCmd_ContextCancellation(t *testing.T) {
 }
 
 func TestUpdate_TurnCompleteSuccessRebuildsHistory(t *testing.T) {
-	m := initialModel(nil)
+	m := initialModel(nil, "")
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.turnCancel = func() {} // dummy
@@ -148,7 +148,7 @@ func TestUpdate_TurnCompleteSuccessRebuildsHistory(t *testing.T) {
 }
 
 func TestUpdate_TurnCompleteCancellationAppendsNotice(t *testing.T) {
-	m := initialModel(nil)
+	m := initialModel(nil, "")
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.history = []viewMessage{{role: roleUser, content: "hello"}}
@@ -174,7 +174,7 @@ func TestUpdate_TurnCompleteCancellationAppendsNotice(t *testing.T) {
 }
 
 func TestUpdate_TurnCompleteErrorAppendsErrorMessage(t *testing.T) {
-	m := initialModel(nil)
+	m := initialModel(nil, "")
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.history = []viewMessage{{role: roleUser, content: "hello"}}
