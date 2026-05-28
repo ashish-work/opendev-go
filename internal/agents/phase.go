@@ -84,6 +84,18 @@ type PhaseContext struct {
 	// Snapshot can call the calibrator without a separate parameter.
 	// Stable across all iterations of one turn.
 	SystemPrompt string
+
+	// LastResponse is the most recent provider.Response from the
+	// LLM-call phase. Populated when llmCallPhase returns
+	// LoopActionContinue; consumed by the response-processing phase
+	// that runs next. Zero between iterations and at the start of
+	// each iteration before llmCallPhase runs.
+	//
+	// Lives here rather than on LoopAction because LoopAction is
+	// control-flow-only and a Response field would force every
+	// phase return to carry payload data. Per-iteration data
+	// belongs on the per-iteration state bundle.
+	LastResponse provider.Response
 }
 
 // NewPhaseContext constructs a PhaseContext. Called exactly once per

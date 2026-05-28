@@ -169,6 +169,39 @@ func TestPhaseContext_CalibratorReassignmentVisible(t *testing.T) {
 	}
 }
 
+func TestPhaseContext_LastResponseStartsZero(t *testing.T) {
+	// PhaseContext is constructed fresh per iteration; LastResponse
+	// must be the zero provider.Response on entry so a phase
+	// reading it before llm_call runs sees a clean slate.
+	pc, _ := newTestContext(t)
+	if pc.LastResponse.Content != "" {
+		t.Errorf("LastResponse.Content = %q, want empty on fresh PhaseContext",
+			pc.LastResponse.Content)
+	}
+	if pc.LastResponse.ToolCalls != nil {
+		t.Errorf("LastResponse.ToolCalls = %+v, want nil on fresh PhaseContext",
+			pc.LastResponse.ToolCalls)
+	}
+}
+
+func TestPhaseContext_LastResponseRoundTrips(t *testing.T) {
+	// llm_call writes the response into pc; the next phase reads it.
+	// Verify assignment-then-read works through the pointer.
+	pc, _ := newTestContext(t)
+	pc.LastResponse = provider.Response{
+		Content:      "final answer",
+		FinishReason: "stop",
+		Usage:        provider.Usage{PromptTokens: 50, CompletionTokens: 10},
+	}
+	if pc.LastResponse.Content != "final answer" {
+		t.Errorf("LastResponse round-trip failed; got %q", pc.LastResponse.Content)
+	}
+	if pc.LastResponse.Usage.PromptTokens != 50 {
+		t.Errorf("LastResponse.Usage.PromptTokens = %d, want 50",
+			pc.LastResponse.Usage.PromptTokens)
+	}
+}
+
 func TestPhaseContext_IterIsMutable(t *testing.T) {
 	pc, _ := newTestContext(t)
 	pc.Iter = 5

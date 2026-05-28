@@ -152,48 +152,19 @@ func (l *ReactLoop) RunWithStream(
 			return action.Result, action.Tracker, action.Err
 		}
 
-		// Snapshot the request-side message count BEFORE the call —
-		// that's what apiPromptTokens will refer to once the response
-		// comes back. (Assistant reply gets appended after.)
-		msgCountAtRequest := len(history)
-
-		req := provider.Request{
-			Model:    l.Config.Workflow.Resolve(workflow.SlotExecution).Model,
-			Messages: history,
-			Tools:    SchemasFor(l.Registry),
+		// LLM-call phase: build request, dispatch via Call/Stream,
+		// update the calibrator. The phase stashes the response on
+		// pc.LastResponse and updates pc.Tracker + pc.Calibrator in
+		// place; we sync back to the still-inline locals here. Once
+		// process_response and execute_sequential land (#20/#21),
+		// the locals disappear and pc becomes the single source of
+		// truth.
+		if action := l.llmCallPhase(ctx, pc); action.Kind == LoopActionReturn {
+			return action.Result, action.Tracker, action.Err
 		}
-
-		var (
-			resp       provider.Response
-			newTracker cost.Tracker
-			err        error
-		)
-		if sink != nil {
-			resp, newTracker, err = l.Caller.Stream(ctx, req, tracker, sink)
-		} else {
-			resp, newTracker, err = l.Caller.Call(ctx, req, tracker)
-		}
-		tracker = newTracker
-		if err != nil {
-			// Context cancellation deserves ErrInterrupted (the agent-
-			// layer sentinel for "user wants out") rather than ErrLLM,
-			// which suggests an API failure. Either provider path
-			// (Call or Stream) wraps ctx.Canceled in its error chain.
-			if ctx.Err() != nil {
-				return Result{
-						Messages:    history,
-						Interrupted: true,
-						Budget:      snapshot(),
-					}, tracker,
-					fmt.Errorf("%w: iter %d: %v", ErrInterrupted, iter, err)
-			}
-			return Result{Messages: history, Budget: snapshot()}, tracker,
-				fmt.Errorf("%w: %v", ErrLLM, err)
-		}
-
-		// Calibrate against the provider's authoritative count for the
-		// messages it just saw.
-		cal = cal.Update(resp.Usage.PromptTokens, msgCountAtRequest)
+		tracker = pc.Tracker
+		cal = pc.Calibrator
+		resp := pc.LastResponse
 
 		// No tool calls = final answer. Append the assistant text and
 		// exit. We do this BEFORE the tool-call path so we can hold
