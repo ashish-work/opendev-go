@@ -110,6 +110,24 @@ func (a Adapter) APIVersionHeader() string {
 //  3. Assistant ToolCalls are expanded into tool_use content blocks
 //     alongside any text the assistant also emitted.
 func (a Adapter) BuildRequest(req provider.Request) ([]byte, error) {
+	return json.Marshal(a.buildPayload(req, false))
+}
+
+// BuildStreamRequest is the streaming twin of BuildRequest. Same
+// payload plus "stream": true. Unlike OpenAI's streaming we don't need
+// any extra options — Anthropic's usage data flows through the
+// message_start / message_delta events automatically. Separate method
+// rather than a flag on BuildRequest so callers state their intent at
+// the call site.
+func (a Adapter) BuildStreamRequest(req provider.Request) ([]byte, error) {
+	return json.Marshal(a.buildPayload(req, true))
+}
+
+// buildPayload is the shared body of BuildRequest and BuildStreamRequest.
+// Returns a fresh map per call so callers can't mutate each other's
+// state — matches the immutability rule used everywhere else in this
+// codebase.
+func (a Adapter) buildPayload(req provider.Request, stream bool) map[string]any {
 	systemText, others := extractSystem(req.Messages)
 	messages := buildMessages(others)
 
@@ -142,7 +160,11 @@ func (a Adapter) BuildRequest(req provider.Request) ([]byte, error) {
 		payload["tools"] = convertTools(req.Tools)
 	}
 
-	return json.Marshal(payload)
+	if stream {
+		payload["stream"] = true
+	}
+
+	return payload
 }
 
 // extractSystem walks the messages, returning the joined system-prompt

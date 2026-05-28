@@ -3,7 +3,6 @@ package anthropic
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -112,20 +111,6 @@ func (c *Client) Call(ctx context.Context, req provider.Request) (provider.Respo
 	}
 
 	return c.Adapter.ParseResponse(respBody)
-}
-
-// errStreamNotImplemented is the setup-error returned by Stream until
-// the SSE implementation lands in the next commit. Mirrors the same
-// pattern used by openai.Client.Stream before its SSE implementation
-// landed — same teaching value: one named sentinel that the next
-// commit replaces, no string-literal sprawl.
-var errStreamNotImplemented = errors.New("anthropic: streaming not yet implemented")
-
-// Stream implements provider.Provider. Returns
-// (nil, errStreamNotImplemented) as a placeholder; the real
-// SSE-parsing implementation lands in the next commit (#50).
-func (c *Client) Stream(_ context.Context, _ provider.Request) (<-chan provider.StreamEvent, error) {
-	return nil, errStreamNotImplemented
 }
 
 // HTTPError is returned by Call for any non-2xx response. Use errors.As

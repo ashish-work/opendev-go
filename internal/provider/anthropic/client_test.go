@@ -225,20 +225,6 @@ func TestClientCall_NilHTTPClientFallsBackToDefault(t *testing.T) {
 	}
 }
 
-func TestClientStream_StubReturnsError(t *testing.T) {
-	c := NewClient("test-key")
-	ch, err := c.Stream(context.Background(), provider.Request{Model: "claude"})
-	if err == nil {
-		t.Fatal("expected error from streaming stub, got nil")
-	}
-	if ch != nil {
-		t.Errorf("expected nil channel from stub, got %v", ch)
-	}
-	if !errors.Is(err, errStreamNotImplemented) {
-		t.Errorf("err = %v, want errStreamNotImplemented", err)
-	}
-}
-
 func TestClient_Name(t *testing.T) {
 	if c := NewClient("k"); c.Name() != "anthropic" {
 		t.Errorf("Name = %q, want anthropic", c.Name())
