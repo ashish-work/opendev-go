@@ -120,6 +120,22 @@ type model struct {
 	// captured from each turn's Result.Budget. Drives the "ctx N.N%"
 	// display on the status bar.
 	lastBudget budget.Snapshot
+
+	// streamCh is the per-turn StreamEvent channel the agent loop
+	// writes to. Lifecycle: created at Ctrl-D submit, closed at
+	// turnCompleteMsg. nil while idle. Owned by the model — only
+	// Update reads it (via the nextStreamEventCmd Cmd), only the
+	// agent loop writes to it.
+	streamCh chan provider.StreamEvent
+
+	// pendingAssistantIdx is the index into history of the
+	// in-progress assistant viewMessage currently absorbing
+	// streamed TextDelta events. -1 means no message is in progress
+	// (next TextDelta will append a new one). Reset on ToolCallStart
+	// and on turnCompleteMsg so subsequent text starts a fresh
+	// assistant entry rather than concatenating into the previous
+	// iteration's reply.
+	pendingAssistantIdx int
 }
 
 // initialModel constructs the starting state with both widgets ready,
@@ -137,10 +153,11 @@ func initialModel(loop *agents.ReactLoop, modelName string) model {
 	vp := viewport.New(0, 0) // sized properly on first WindowSizeMsg
 
 	return model{
-		textarea:  ta,
-		viewport:  vp,
-		loop:      loop,
-		modelName: modelName,
+		textarea:            ta,
+		viewport:            vp,
+		loop:                loop,
+		modelName:           modelName,
+		pendingAssistantIdx: -1,
 	}
 }
 
@@ -255,24 +272,62 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.history = append(m.history, viewMessage{role: roleUser, content: input})
 			m.textarea.Reset()
 
-			// Build the cancellable context, store the cancel func so
-			// Ctrl-C can call it, and dispatch the turn.
+			// Build the cancellable context + per-turn stream channel,
+			// store the cancel func so Ctrl-C can call it, and dispatch
+			// the turn alongside the event-reader Cmd. Bubble Tea runs
+			// both Cmds concurrently and serializes their resulting
+			// Msgs back through Update.
 			ctx, cancel := context.WithCancel(context.Background())
 			m.turnCancel = cancel
 			m.thinking = true
+			m.streamCh = make(chan provider.StreamEvent, streamSinkBufferSize)
+			m.pendingAssistantIdx = -1
 
 			m.viewport.SetContent(m.renderHistory())
 			m.viewport.GotoBottom()
 
-			return m, runTurnCmd(ctx, m.loop, input)
+			return m, tea.Batch(
+				runTurnCmd(ctx, m.loop, input, m.streamCh),
+				nextStreamEventCmd(m.streamCh),
+			)
 		}
+
+	case streamEventMsg:
+		// One streamed event lands. Update the live transcript and
+		// re-arm the read Cmd so the next event flows in.
+		m = applyStreamEvent(m, msg.event)
+		m.viewport.SetContent(m.renderHistory())
+		m.viewport.GotoBottom()
+		// Re-issue the read Cmd if the channel is still alive. A nil
+		// channel here means turnCompleteMsg already cleaned up, which
+		// shouldn't normally happen (turnCompleteMsg closes the
+		// channel, which produces streamSinkClosedMsg, not another
+		// streamEventMsg), but we're defensive.
+		if m.streamCh == nil {
+			return m, nil
+		}
+		return m, nextStreamEventCmd(m.streamCh)
+
+	case streamSinkClosedMsg:
+		// Channel closed. Stop chaining reads. turnCompleteMsg arrives
+		// (or already arrived) on a separate path; no UI work needed
+		// here. Leaving m.streamCh as-is until turnCompleteMsg
+		// finalizes is fine — Update never reads from it directly.
+		return m, nil
 
 	case turnCompleteMsg:
 		// Turn finished — success, error, or cancellation. Drop the
 		// thinking state and the (now-fired) cancel func before
-		// inspecting the result.
+		// inspecting the result. Close the stream channel so the
+		// pending nextStreamEventCmd unblocks with
+		// streamSinkClosedMsg.
 		m.thinking = false
 		m.turnCancel = nil
+		if m.streamCh != nil {
+			close(m.streamCh)
+			m.streamCh = nil
+		}
+		m.pendingAssistantIdx = -1
 
 		// Fold the per-turn tracker into the session tracker so the
 		// status bar shows CUMULATIVE totals (each loop.Run returns
@@ -434,6 +489,87 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// applyStreamEvent folds one StreamEvent into the model's transcript.
+// Returns the updated model. Pure transformation; caller refreshes
+// the viewport.
+//
+// Event handling:
+//   - TextDelta: extend the pending assistant message, or create one
+//     when none is in progress.
+//   - ToolCallStart: reset the pending assistant (so the next
+//     TextDelta starts fresh) and append a placeholder tool entry.
+//   - ToolCallDone: replace the placeholder body with the assembled
+//     JSON arguments (if any) so the user sees what was invoked.
+//   - Error: append an "(stream error: ...)" assistant message; reset
+//     the pending state so the next iteration starts cleanly.
+//   - Everything else (Usage, Done, ReasoningDelta, ToolCallDelta):
+//     ignored at the live-transcript level. Usage flows in via
+//     turnCompleteMsg; Done is just a turn-iteration boundary;
+//     ReasoningDelta has no dedicated display slot yet; ToolCallDelta
+//     fragments would render as ugly partial JSON.
+func applyStreamEvent(m model, ev provider.StreamEvent) model {
+	switch ev.Kind {
+	case provider.StreamEventTextDelta:
+		if m.pendingAssistantIdx == -1 {
+			m.history = append(m.history, viewMessage{
+				role:    roleAssistant,
+				content: ev.Text,
+			})
+			m.pendingAssistantIdx = len(m.history) - 1
+		} else {
+			m.history[m.pendingAssistantIdx].content += ev.Text
+		}
+
+	case provider.StreamEventToolCallStart:
+		// Reset the pending assistant slot so any further text deltas
+		// start a NEW assistant message rather than appending into the
+		// previous iteration's reply.
+		m.pendingAssistantIdx = -1
+		m.history = append(m.history, viewMessage{
+			role:     roleTool,
+			toolName: ev.ToolCall.Name,
+			content:  "(running...)",
+		})
+
+	case provider.StreamEventToolCallDone:
+		// Find the most recent tool message with this name and swap
+		// its content from "(running...)" to the assembled args. This
+		// is a heuristic but works in practice because a single tool
+		// is typically invoked once per iteration; if the model calls
+		// the same tool twice, the second invocation just gets a
+		// fresh "(running...)" card from the next ToolCallStart.
+		for i := len(m.history) - 1; i >= 0; i-- {
+			if m.history[i].role == roleTool && m.history[i].toolName == ev.ToolCall.Name &&
+				m.history[i].content == "(running...)" {
+				if ev.ToolCall.Arguments != "" {
+					m.history[i].content = ev.ToolCall.Arguments
+				} else {
+					m.history[i].content = "(no args)"
+				}
+				break
+			}
+		}
+
+	case provider.StreamEventError:
+		m.pendingAssistantIdx = -1
+		errText := "(stream error)"
+		if ev.Err != nil {
+			errText = "(stream error: " + ev.Err.Error() + ")"
+		}
+		m.history = append(m.history, viewMessage{
+			role:    roleAssistant,
+			content: errText,
+		})
+
+	default:
+		// Done / Usage / ReasoningDelta / ToolCallDelta: nothing to do
+		// at the live-transcript level for this commit. Adding hooks
+		// here (reasoning panels, mid-stream usage refresh, etc.) is a
+		// follow-up.
+	}
+	return m
 }
 
 // Run starts the TUI against the given agent loop. Blocks until the

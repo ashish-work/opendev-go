@@ -88,7 +88,34 @@ func NewReactLoop(caller *LlmCaller, registry *tools.Registry, cfg Config) *Reac
 // Failure paths: error wraps ErrMaxIterations / ErrInterrupted /
 // ErrLLM / ErrToolExec; the Result still carries the partial Messages
 // history so callers can inspect what happened.
+//
+// Run is a thin wrapper around RunWithStream with a nil sink. Callers
+// that don't need streaming use this; the streaming path costs nothing
+// to skip.
 func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Tracker, error) {
+	return l.RunWithStream(ctx, userTask, nil)
+}
+
+// RunWithStream is Run plus a streaming sink. When sink is non-nil the
+// per-iteration LLM call uses Provider.Stream and forwards each
+// StreamEvent to sink as it arrives. When sink is nil the loop uses
+// Provider.Call exactly as v1 did.
+//
+// Sink ownership: the caller creates and closes sink. The loop only
+// writes to it; closing is the caller's job, not the loop's. This
+// matches the contract LlmCaller.Stream documents and lets the TUI
+// own per-turn channel lifetime cleanly.
+//
+// Multi-iteration semantics: a single turn may issue multiple LLM
+// calls (model → tools → model → tools → final). Every iteration
+// streams to the SAME sink. Consumers should treat each
+// StreamEventDone as "this iteration's LLM call finished" — not "the
+// turn finished." The turn boundary is when this function returns.
+func (l *ReactLoop) RunWithStream(
+	ctx context.Context,
+	userTask string,
+	sink chan<- provider.StreamEvent,
+) (Result, cost.Tracker, error) {
 	history := []provider.Message{
 		SystemMessage(l.Config.SystemPrompt),
 		UserMessage(userTask),
@@ -128,9 +155,30 @@ func (l *ReactLoop) Run(ctx context.Context, userTask string) (Result, cost.Trac
 			Tools:    SchemasFor(l.Registry),
 		}
 
-		resp, newTracker, err := l.Caller.Call(ctx, req, tracker)
+		var (
+			resp       provider.Response
+			newTracker cost.Tracker
+			err        error
+		)
+		if sink != nil {
+			resp, newTracker, err = l.Caller.Stream(ctx, req, tracker, sink)
+		} else {
+			resp, newTracker, err = l.Caller.Call(ctx, req, tracker)
+		}
 		tracker = newTracker
 		if err != nil {
+			// Context cancellation deserves ErrInterrupted (the agent-
+			// layer sentinel for "user wants out") rather than ErrLLM,
+			// which suggests an API failure. Either provider path
+			// (Call or Stream) wraps ctx.Canceled in its error chain.
+			if ctx.Err() != nil {
+				return Result{
+						Messages:    history,
+						Interrupted: true,
+						Budget:      snapshot(),
+					}, tracker,
+					fmt.Errorf("%w: iter %d: %v", ErrInterrupted, iter, err)
+			}
 			return Result{Messages: history, Budget: snapshot()}, tracker,
 				fmt.Errorf("%w: %v", ErrLLM, err)
 		}

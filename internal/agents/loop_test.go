@@ -38,11 +38,57 @@ func (f *fakeProvider) Call(_ context.Context, req provider.Request) (provider.R
 	return f.responses[i], nil
 }
 
-// Stream satisfies provider.Provider. Loop tests don't exercise the
-// streaming path; return a setup error so any test that accidentally
-// reaches for it fails loudly.
-func (f *fakeProvider) Stream(_ context.Context, _ provider.Request) (<-chan provider.StreamEvent, error) {
-	return nil, fmt.Errorf("fakeProvider: streaming not implemented in tests")
+// Stream emits a synthesized event sequence derived from the next
+// scripted response: per-text-block TextDelta events, per-tool_call
+// Start/Delta/Done events, then a terminal Done carrying the full
+// response. This lets loop tests exercise RunWithStream against the
+// same scripted state Call uses, without scripting events separately.
+func (f *fakeProvider) Stream(ctx context.Context, req provider.Request) (<-chan provider.StreamEvent, error) {
+	if f.calls >= len(f.responses) {
+		return nil, fmt.Errorf("fakeProvider: out of scripted responses (call #%d)", f.calls+1)
+	}
+	f.requests = append(f.requests, req)
+	i := f.calls
+	f.calls++
+	if i < len(f.errors) && f.errors[i] != nil {
+		return nil, f.errors[i]
+	}
+	resp := f.responses[i]
+
+	ch := make(chan provider.StreamEvent, 8)
+	go func() {
+		defer close(ch)
+		emit := func(ev provider.StreamEvent) bool {
+			select {
+			case ch <- ev:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		if resp.Content != "" {
+			if !emit(provider.NewTextDelta(resp.Content)) {
+				return
+			}
+		}
+		for idx, tc := range resp.ToolCalls {
+			if !emit(provider.NewToolCallStart(idx, tc.ID, tc.Name)) {
+				return
+			}
+			args := string(tc.Arguments)
+			if args != "" {
+				if !emit(provider.NewToolCallDelta(idx, args)) {
+					return
+				}
+			}
+			if !emit(provider.NewToolCallDone(idx, tc.ID, tc.Name, args)) {
+				return
+			}
+		}
+		respCopy := resp
+		_ = emit(provider.NewDone(&respCopy))
+	}()
+	return ch, nil
 }
 
 // fakeTool is a scripted Tool. Records every Execute call.
@@ -542,6 +588,171 @@ func TestDoomLoop_RedirectDoesNotHaltDispatch(t *testing.T) {
 	if !found {
 		t.Error("history missing doom-loop warning system message")
 	}
+}
+
+// drainEvents collects all events from ch until close. Used by
+// RunWithStream tests to assert what flowed through the sink.
+func drainEvents(ch <-chan provider.StreamEvent) []provider.StreamEvent {
+	var out []provider.StreamEvent
+	for ev := range ch {
+		out = append(out, ev)
+	}
+	return out
+}
+
+func TestRunWithStream_NilSinkPreservesRunBehavior(t *testing.T) {
+	// Regression: RunWithStream with nil sink must behave identically
+	// to Run (which v1 tests already cover). Verify by running the
+	// simplest single-turn scenario and checking outputs match Run.
+	p := &fakeProvider{responses: []provider.Response{{Content: "ok"}}}
+	loop := newLoop(t, p, nil)
+	result, _, err := loop.RunWithStream(context.Background(), "hi", nil)
+	if err != nil {
+		t.Fatalf("RunWithStream: %v", err)
+	}
+	if result.Content != "ok" {
+		t.Errorf("Content = %q, want ok", result.Content)
+	}
+}
+
+func TestRunWithStream_ForwardsEventsForSingleIteration(t *testing.T) {
+	p := &fakeProvider{responses: []provider.Response{{Content: "hello world"}}}
+	loop := newLoop(t, p, nil)
+
+	sink := make(chan provider.StreamEvent, 8)
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		_, _, err := loop.RunWithStream(context.Background(), "hi", sink)
+		if err != nil {
+			t.Errorf("RunWithStream: %v", err)
+		}
+		close(sink)
+	}()
+
+	events := drainEvents(sink)
+	<-doneCh
+
+	// Synthesized sequence: TextDelta("hello world"), Done.
+	if len(events) != 2 {
+		t.Fatalf("event count = %d, want 2: %+v", len(events), events)
+	}
+	if events[0].Kind != provider.StreamEventTextDelta || events[0].Text != "hello world" {
+		t.Errorf("events[0] = %+v, want TextDelta 'hello world'", events[0])
+	}
+	if events[1].Kind != provider.StreamEventDone {
+		t.Errorf("events[1] = %+v, want Done", events[1])
+	}
+}
+
+func TestRunWithStream_ForwardsEventsAcrossMultipleIterations(t *testing.T) {
+	// Iteration 1: assistant requests one tool call.
+	// Iteration 2: assistant produces final text after the tool result.
+	reg := tools.NewRegistry()
+	if err := reg.Register(echoTool("foo")); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	p := &fakeProvider{
+		responses: []provider.Response{
+			{ToolCalls: []provider.ToolCall{{
+				ID:        "call_1",
+				Name:      "foo",
+				Arguments: json.RawMessage(`{"x":1}`),
+			}}},
+			{Content: "all done"},
+		},
+	}
+	loop := NewReactLoop(NewLlmCaller(p, cost.Pricing{}), reg, Config{
+		Workflow:      workflow.Config{Execution: workflow.SlotConfig{Model: "fake"}},
+		MaxIterations: 5,
+	})
+
+	sink := make(chan provider.StreamEvent, 16)
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		_, _, err := loop.RunWithStream(context.Background(), "do it", sink)
+		if err != nil {
+			t.Errorf("RunWithStream: %v", err)
+		}
+		close(sink)
+	}()
+	events := drainEvents(sink)
+	<-doneCh
+
+	var (
+		doneCount       int
+		toolStartCount  int
+		toolDoneCount   int
+		finalTextSeen   bool
+	)
+	for _, ev := range events {
+		switch ev.Kind {
+		case provider.StreamEventDone:
+			doneCount++
+		case provider.StreamEventToolCallStart:
+			toolStartCount++
+		case provider.StreamEventToolCallDone:
+			toolDoneCount++
+		case provider.StreamEventTextDelta:
+			if ev.Text == "all done" {
+				finalTextSeen = true
+			}
+		}
+	}
+	if doneCount != 2 {
+		t.Errorf("Done events = %d, want 2 (one per iteration)", doneCount)
+	}
+	if toolStartCount != 1 || toolDoneCount != 1 {
+		t.Errorf("tool events: start=%d done=%d, want 1/1", toolStartCount, toolDoneCount)
+	}
+	if !finalTextSeen {
+		t.Errorf("final 'all done' text never streamed to sink")
+	}
+}
+
+func TestRunWithStream_StreamingErrorBecomesErrLLM(t *testing.T) {
+	// Provider's Stream emits an Error mid-stream. The loop should
+	// surface ErrLLM, not crash.
+	p := &fakeProvider{
+		responses: []provider.Response{{Content: "ignored"}},
+		errors:    []error{fmt.Errorf("stream blew up")},
+	}
+	loop := newLoop(t, p, nil)
+	sink := make(chan provider.StreamEvent, 8)
+	go func() {
+		_, _, err := loop.RunWithStream(context.Background(), "hi", sink)
+		if err == nil {
+			t.Errorf("expected error from streaming failure")
+		}
+		if !errors.Is(err, ErrLLM) {
+			t.Errorf("err = %v, want wraps ErrLLM", err)
+		}
+		close(sink)
+	}()
+	_ = drainEvents(sink)
+}
+
+func TestRunWithStream_CtxCancelBecomesErrInterrupted(t *testing.T) {
+	// Provider's Stream respects ctx cancellation. The loop should
+	// wrap it in ErrInterrupted, not ErrLLM, because the user is the
+	// proximate cause (not the API).
+	p := &fakeProvider{responses: []provider.Response{{Content: "x"}}}
+	loop := newLoop(t, p, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	sink := make(chan provider.StreamEvent, 8)
+	go func() {
+		defer close(sink)
+		_, _, err := loop.RunWithStream(ctx, "hi", sink)
+		if !errors.Is(err, ErrInterrupted) {
+			t.Errorf("err = %v, want wraps ErrInterrupted", err)
+		}
+	}()
+	_ = drainEvents(sink)
 }
 
 func TestSchemasForReturnsSortedToolList(t *testing.T) {

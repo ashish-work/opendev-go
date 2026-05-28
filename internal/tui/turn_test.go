@@ -41,11 +41,54 @@ func (s stubProvider) Call(ctx context.Context, req provider.Request) (provider.
 	return s.response, nil
 }
 
-// Stream satisfies provider.Provider. The TUI tests don't exercise
-// streaming yet (the loop still uses Call) — return a setup error so
-// any accidental Stream call in a future test fails fast and visibly.
-func (s stubProvider) Stream(_ context.Context, _ provider.Request) (<-chan provider.StreamEvent, error) {
-	return nil, errors.New("stubProvider: streaming not implemented in tests")
+// Stream synthesizes a deterministic event sequence from the stub's
+// response field: a TextDelta for the content, Start/Delta/Done events
+// per tool_call, then a terminal Done with the full response. Sticks
+// to the same scripted state Call uses so individual tests don't have
+// to script events separately.
+func (s stubProvider) Stream(ctx context.Context, _ provider.Request) (<-chan provider.StreamEvent, error) {
+	if s.callErr != nil {
+		return nil, s.callErr
+	}
+	resp := s.response
+	if resp.Content == "" && len(resp.ToolCalls) == 0 {
+		resp = provider.Response{Content: "ok"}
+	}
+
+	ch := make(chan provider.StreamEvent, 8)
+	go func() {
+		defer close(ch)
+		send := func(ev provider.StreamEvent) bool {
+			select {
+			case ch <- ev:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+		if resp.Content != "" {
+			if !send(provider.NewTextDelta(resp.Content)) {
+				return
+			}
+		}
+		for i, tc := range resp.ToolCalls {
+			if !send(provider.NewToolCallStart(i, tc.ID, tc.Name)) {
+				return
+			}
+			args := string(tc.Arguments)
+			if args != "" {
+				if !send(provider.NewToolCallDelta(i, args)) {
+					return
+				}
+			}
+			if !send(provider.NewToolCallDone(i, tc.ID, tc.Name, args)) {
+				return
+			}
+		}
+		respCopy := resp
+		_ = send(provider.NewDone(&respCopy))
+	}()
+	return ch, nil
 }
 
 // newTestLoop builds a *agents.ReactLoop wired against the given stub
@@ -64,7 +107,7 @@ func newTestLoop(t *testing.T, p stubProvider) *agents.ReactLoop {
 func TestRunTurnCmd_ProducesTurnCompleteMsg(t *testing.T) {
 	loop := newTestLoop(t, stubProvider{response: provider.Response{Content: "hi back"}})
 	ctx := context.Background()
-	cmd := runTurnCmd(ctx, loop, "hello")
+	cmd := runTurnCmd(ctx, loop, "hello", nil)
 	if cmd == nil {
 		t.Fatal("runTurnCmd should return a non-nil tea.Cmd")
 	}
@@ -83,7 +126,7 @@ func TestRunTurnCmd_ProducesTurnCompleteMsg(t *testing.T) {
 
 func TestRunTurnCmd_PropagatesProviderError(t *testing.T) {
 	loop := newTestLoop(t, stubProvider{callErr: errors.New("provider boom")})
-	cmd := runTurnCmd(context.Background(), loop, "hello")
+	cmd := runTurnCmd(context.Background(), loop, "hello", nil)
 	msg := cmd()
 	tcMsg := msg.(turnCompleteMsg)
 	if tcMsg.err == nil {
@@ -101,7 +144,7 @@ func TestRunTurnCmd_ContextCancellation(t *testing.T) {
 	loop := newTestLoop(t, stubProvider{})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled before the goroutine runs
-	cmd := runTurnCmd(ctx, loop, "hello")
+	cmd := runTurnCmd(ctx, loop, "hello", nil)
 	msg := cmd()
 	tcMsg := msg.(turnCompleteMsg)
 	if tcMsg.err == nil {
@@ -276,6 +319,197 @@ func TestTranslateMessages_UnknownRoleSkipped(t *testing.T) {
 	}
 	if got := translateMessages(msgs); len(got) != 0 {
 		t.Errorf("unknown role should be skipped, got %d", len(got))
+	}
+}
+
+func TestApplyStreamEvent_TextDeltaAccumulatesIntoOneMessage(t *testing.T) {
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+	m = applyStreamEvent(m, provider.NewTextDelta("Hel"))
+	m = applyStreamEvent(m, provider.NewTextDelta("lo "))
+	m = applyStreamEvent(m, provider.NewTextDelta("world"))
+	if len(m.history) != 1 {
+		t.Fatalf("history len = %d, want 1 (deltas should accumulate into one message)", len(m.history))
+	}
+	if m.history[0].role != roleAssistant || m.history[0].content != "Hello world" {
+		t.Errorf("history[0] = %+v, want assistant 'Hello world'", m.history[0])
+	}
+	if m.pendingAssistantIdx != 0 {
+		t.Errorf("pendingAssistantIdx = %d, want 0", m.pendingAssistantIdx)
+	}
+}
+
+func TestApplyStreamEvent_ToolCallStartResetsPending(t *testing.T) {
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+	// First, accumulate some assistant text.
+	m = applyStreamEvent(m, provider.NewTextDelta("Let me check"))
+	if m.pendingAssistantIdx != 0 {
+		t.Fatalf("pendingAssistantIdx after first delta = %d, want 0", m.pendingAssistantIdx)
+	}
+	// ToolCallStart should reset pending so the next TextDelta starts a NEW message.
+	m = applyStreamEvent(m, provider.NewToolCallStart(0, "call_1", "read_file"))
+	if m.pendingAssistantIdx != -1 {
+		t.Errorf("pendingAssistantIdx after ToolCallStart = %d, want -1", m.pendingAssistantIdx)
+	}
+	if len(m.history) != 2 {
+		t.Fatalf("history len = %d, want 2 (assistant text + tool placeholder)", len(m.history))
+	}
+	if m.history[1].role != roleTool || m.history[1].toolName != "read_file" {
+		t.Errorf("history[1] = %+v, want tool 'read_file'", m.history[1])
+	}
+	if m.history[1].content != "(running...)" {
+		t.Errorf("tool placeholder = %q, want '(running...)'", m.history[1].content)
+	}
+	// A subsequent TextDelta after the tool starts a fresh assistant message.
+	m = applyStreamEvent(m, provider.NewTextDelta("done"))
+	if len(m.history) != 3 {
+		t.Fatalf("history len after next-iter text = %d, want 3", len(m.history))
+	}
+	if m.history[2].content != "done" {
+		t.Errorf("new assistant message content = %q, want 'done'", m.history[2].content)
+	}
+}
+
+func TestApplyStreamEvent_ToolCallDoneReplacesPlaceholder(t *testing.T) {
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+	m = applyStreamEvent(m, provider.NewToolCallStart(0, "call_1", "read_file"))
+	m = applyStreamEvent(m, provider.NewToolCallDone(0, "call_1", "read_file", `{"path":"x.go"}`))
+	last := m.history[len(m.history)-1]
+	if last.content != `{"path":"x.go"}` {
+		t.Errorf("tool content after Done = %q, want assembled args", last.content)
+	}
+}
+
+func TestApplyStreamEvent_ErrorAppendsAssistantMessage(t *testing.T) {
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+	m = applyStreamEvent(m, provider.NewTextDelta("partial"))
+	m = applyStreamEvent(m, provider.NewError(errors.New("api blew up")))
+	last := m.history[len(m.history)-1]
+	if last.role != roleAssistant {
+		t.Errorf("last role = %d, want roleAssistant", last.role)
+	}
+	if !strings.Contains(last.content, "api blew up") {
+		t.Errorf("error message = %q, want to mention 'api blew up'", last.content)
+	}
+	if m.pendingAssistantIdx != -1 {
+		t.Errorf("pendingAssistantIdx after error = %d, want -1", m.pendingAssistantIdx)
+	}
+}
+
+func TestApplyStreamEvent_DoneAndUsageAndDeltaIgnored(t *testing.T) {
+	// These events flow through the loop's stream but have no
+	// dedicated UI representation in this commit. Verify they don't
+	// corrupt history.
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+	before := len(m.history)
+	m = applyStreamEvent(m, provider.NewDone(&provider.Response{Content: "ignored"}))
+	m = applyStreamEvent(m, provider.NewUsage(provider.Usage{PromptTokens: 100}))
+	m = applyStreamEvent(m, provider.NewToolCallDelta(0, `{"part":`))
+	m = applyStreamEvent(m, provider.NewReasoningDelta("hmm"))
+	if len(m.history) != before {
+		t.Errorf("history len = %d, want %d (events should not append)", len(m.history), before)
+	}
+}
+
+func TestUpdate_StreamEventMsg_AppendsTextAndRearmsCmd(t *testing.T) {
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+	m.thinking = true
+	m.streamCh = make(chan provider.StreamEvent, 4)
+	m.pendingAssistantIdx = -1
+
+	next, cmd := m.Update(streamEventMsg{event: provider.NewTextDelta("hello")})
+	got := next.(model)
+	if len(got.history) != 1 || got.history[0].content != "hello" {
+		t.Errorf("history = %+v, want one assistant message 'hello'", got.history)
+	}
+	if cmd == nil {
+		t.Errorf("Update should return the next read Cmd to re-arm the loop")
+	}
+}
+
+func TestUpdate_StreamSinkClosedMsg_NoOp(t *testing.T) {
+	// streamSinkClosedMsg arriving while idle (or after turnComplete)
+	// should be a no-op: don't crash, don't return a Cmd.
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+
+	next, cmd := m.Update(streamSinkClosedMsg{})
+	if cmd != nil {
+		t.Errorf("streamSinkClosedMsg should not return a Cmd, got %v", cmd)
+	}
+	if next.(model).history != nil && len(next.(model).history) != 0 {
+		t.Errorf("history mutated unexpectedly: %+v", next.(model).history)
+	}
+}
+
+func TestUpdate_TurnCompleteClosesStreamChannel(t *testing.T) {
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+	m.thinking = true
+	m.streamCh = make(chan provider.StreamEvent, 4)
+	m.pendingAssistantIdx = 3
+
+	next, _ := m.Update(turnCompleteMsg{result: agents.Result{}})
+	got := next.(model)
+	if got.streamCh != nil {
+		t.Errorf("streamCh should be nil after turnCompleteMsg")
+	}
+	if got.pendingAssistantIdx != -1 {
+		t.Errorf("pendingAssistantIdx = %d, want -1 after turnCompleteMsg", got.pendingAssistantIdx)
+	}
+}
+
+func TestUpdate_MidStreamCancellationKeepsPartialText(t *testing.T) {
+	// Simulate: user submits, two text deltas land, user cancels, the
+	// loop returns ErrInterrupted. The partial assistant message
+	// should survive AND get a "(turn cancelled)" notice.
+	m := initialModel(nil, "")
+	m, _ = applyWindowSize(m, 100, 30)
+	m.thinking = true
+	m.history = []viewMessage{{role: roleUser, content: "long task"}}
+	m.streamCh = make(chan provider.StreamEvent, 4)
+
+	// Two deltas land via the streaming path.
+	next, _ := m.Update(streamEventMsg{event: provider.NewTextDelta("I started")})
+	m = next.(model)
+	next, _ = m.Update(streamEventMsg{event: provider.NewTextDelta(" working")})
+	m = next.(model)
+	if len(m.history) != 2 || m.history[1].content != "I started working" {
+		t.Fatalf("partial text not accumulated: %+v", m.history)
+	}
+
+	// User cancels mid-stream → loop returns ErrInterrupted in a
+	// turnCompleteMsg with the loop's partial Result.Messages
+	// (in real flow the loop captures more, but we simulate the empty
+	// case to confirm appendOrReplaceHistory keeps the optimistic
+	// streamed message).
+	next, _ = m.Update(turnCompleteMsg{
+		result: agents.Result{},
+		err:    agents.ErrInterrupted,
+	})
+	got := next.(model)
+
+	// The partial streamed text should still be visible somewhere in
+	// the history, and a "cancelled" notice should be appended.
+	var foundPartial, foundNotice bool
+	for _, vm := range got.history {
+		if strings.Contains(vm.content, "I started working") {
+			foundPartial = true
+		}
+		if strings.Contains(vm.content, "cancelled") {
+			foundNotice = true
+		}
+	}
+	if !foundPartial {
+		t.Errorf("partial streamed text lost after cancellation: %+v", got.history)
+	}
+	if !foundNotice {
+		t.Errorf("cancellation notice missing: %+v", got.history)
 	}
 }
 
