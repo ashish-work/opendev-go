@@ -68,7 +68,8 @@ opendev-go/
 ├── internal/
 │   ├── provider/            # Provider interface + normalized types
 │   │   ├── openai/          # OpenAI-compatible Chat Completions adapter
-│   │   └── anthropic/       # Anthropic Messages API adapter
+│   │   ├── anthropic/       # Anthropic Messages API adapter
+│   │   └── router/          # model→provider routing + shared pricing table
 │   ├── tools/               # Tool interface + registry
 │   │   ├── readfile/        # read_file
 │   │   ├── bash/            # foreground shell command runner

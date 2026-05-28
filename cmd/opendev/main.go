@@ -1,7 +1,8 @@
 // Command opendev is the v1 REPL entry point. Reads one user query per
-// line on stdin, runs the ReAct loop against an OpenAI-compatible
-// provider, prints the assistant's reply and a per-turn cost line,
-// repeats until EOF or "exit".
+// line on stdin, runs the ReAct loop against an LLM provider chosen
+// from the -model flag (claude-* → Anthropic, otherwise OpenAI or any
+// OpenAI-compatible server via -base-url), prints the assistant's
+// reply and a per-turn cost line, repeats until EOF or "exit".
 //
 // This is the v1 closed-loop milestone: model requests tools, the loop
 // executes them, results flow back, model gives a final answer.
@@ -20,8 +21,7 @@ import (
 	"syscall"
 
 	"github.com/ashish-work/opendev-go/internal/agents"
-	"github.com/ashish-work/opendev-go/internal/cost"
-	"github.com/ashish-work/opendev-go/internal/provider/openai"
+	"github.com/ashish-work/opendev-go/internal/provider/router"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/tools/bash"
 	"github.com/ashish-work/opendev-go/internal/tools/editfile"
@@ -44,20 +44,21 @@ const inputBufferSize = 1 << 20 // 1 MB
 
 func main() {
 	model := flag.String("model", "gpt-4o-mini",
-		"OpenAI model name (or any OpenAI-compatible model).")
+		"Model name. claude-* routes to Anthropic; everything else (including OpenAI-compatible servers via -base-url) routes to OpenAI.")
 	maxIter := flag.Int("max-iter", agents.DefaultMaxIterations,
 		"Maximum loop iterations per query before giving up.")
 	systemPrompt := flag.String("system", "",
 		"Override the default system prompt. Empty uses the built-in default.")
-	baseURL := flag.String("base-url", openai.DefaultBaseURL,
-		"Provider base URL (override for proxies / OpenAI-compatible servers).")
+	baseURL := flag.String("base-url", "",
+		"Provider base URL. Empty uses the selected provider's default; non-empty overrides for proxies or compatible servers.")
 	maxContext := flag.Int("max-context", 128_000,
 		"Context-window cap in tokens (for budget calibration). 0 disables the usage percentage.")
 	flag.Parse()
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	envVar := router.EnvVarFor(*model)
+	apiKey := os.Getenv(envVar)
 	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "error: OPENAI_API_KEY must be set")
+		fmt.Fprintln(os.Stderr, router.FormatMissingKey(*model))
 		os.Exit(1)
 	}
 
@@ -71,10 +72,13 @@ func main() {
 	// silent when the dir doesn't exist.
 	truncation.CleanupOldFiles()
 
-	// Wire the closed loop: openai.Client → LlmCaller → ReactLoop.
-	client := openai.NewClient(apiKey)
-	client.Adapter.BaseURL = *baseURL
-	caller := agents.NewLlmCaller(client, pricingFor(*model))
+	// Pick the right provider (openai/anthropic) based on the model name.
+	client, err := router.New(*model, *baseURL, apiKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	caller := agents.NewLlmCaller(client, router.PricingFor(*model))
 
 	registry := tools.NewRegistry()
 	mustRegister(registry, readfile.New())
@@ -200,29 +204,6 @@ func runTurn(loop *agents.ReactLoop, query string, sigs <-chan os.Signal) (float
 	}
 
 	return tracker.TotalCostUSD, tracker.CallCount
-}
-
-// pricingFor returns Pricing for known models. Unknown models fall
-// back to zero Pricing — token counts still flow, cost stays $0.
-//
-// The model name is matched as a prefix to handle "gpt-4o-2024-08-06"
-// style aliases.
-func pricingFor(model string) cost.Pricing {
-	table := []struct {
-		prefix  string
-		pricing cost.Pricing
-	}{
-		{"gpt-4o-mini", cost.Pricing{InputPricePerMillion: 0.15, OutputPricePerMillion: 0.60}},
-		{"gpt-4o", cost.Pricing{InputPricePerMillion: 2.50, OutputPricePerMillion: 10.00}},
-		{"gpt-4-turbo", cost.Pricing{InputPricePerMillion: 10.00, OutputPricePerMillion: 30.00}},
-		{"gpt-3.5-turbo", cost.Pricing{InputPricePerMillion: 0.50, OutputPricePerMillion: 1.50}},
-	}
-	for _, entry := range table {
-		if strings.HasPrefix(model, entry.prefix) {
-			return entry.pricing
-		}
-	}
-	return cost.Pricing{}
 }
 
 // mustRegister fails fast on registry-wiring bugs. We only call this

@@ -5,11 +5,11 @@
 // isolation.
 //
 // This package is the binary's wiring layer: parse flags, validate
-// the API key, build the Provider / Caller / Registry / ReactLoop,
-// hand the loop to internal/tui's Run, surface its exit code. The
-// loop construction mirrors cmd/opendev's setup — that duplication
-// is small (~25 lines) and intentional. If a third caller emerges,
-// extracting into internal/wiring/ would be the right move.
+// the API key for the right provider, build the Provider / Caller /
+// Registry / ReactLoop via internal/provider/router, hand the loop to
+// internal/tui's Run, surface its exit code. Provider construction is
+// delegated to the router (claude-* → Anthropic, everything else →
+// OpenAI) so cmd/opendev and this binary share one source of truth.
 package main
 
 import (
@@ -18,8 +18,7 @@ import (
 	"os"
 
 	"github.com/ashish-work/opendev-go/internal/agents"
-	"github.com/ashish-work/opendev-go/internal/cost"
-	"github.com/ashish-work/opendev-go/internal/provider/openai"
+	"github.com/ashish-work/opendev-go/internal/provider/router"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/tools/bash"
 	"github.com/ashish-work/opendev-go/internal/tools/editfile"
@@ -36,20 +35,21 @@ import (
 
 func main() {
 	model := flag.String("model", "gpt-4o-mini",
-		"OpenAI model name (or any OpenAI-compatible model).")
+		"Model name. claude-* routes to Anthropic; everything else (including OpenAI-compatible servers via -base-url) routes to OpenAI.")
 	maxIter := flag.Int("max-iter", agents.DefaultMaxIterations,
 		"Maximum loop iterations per query before giving up.")
 	systemPrompt := flag.String("system", "",
 		"Override the default system prompt. Empty uses the built-in default.")
-	baseURL := flag.String("base-url", openai.DefaultBaseURL,
-		"Provider base URL (override for proxies / OpenAI-compatible servers).")
+	baseURL := flag.String("base-url", "",
+		"Provider base URL. Empty uses the selected provider's default; non-empty overrides for proxies or compatible servers.")
 	maxContext := flag.Int("max-context", 128_000,
 		"Context-window cap in tokens (for budget calibration). 0 disables the usage percentage.")
 	flag.Parse()
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	envVar := router.EnvVarFor(*model)
+	apiKey := os.Getenv(envVar)
 	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "error: OPENAI_API_KEY must be set")
+		fmt.Fprintln(os.Stderr, router.FormatMissingKey(*model))
 		os.Exit(1)
 	}
 
@@ -63,10 +63,13 @@ func main() {
 	// silent when the dir doesn't exist.
 	truncation.CleanupOldFiles()
 
-	// Wire the closed loop: openai.Client → LlmCaller → ReactLoop.
-	client := openai.NewClient(apiKey)
-	client.Adapter.BaseURL = *baseURL
-	caller := agents.NewLlmCaller(client, pricingFor(*model))
+	// Pick the right provider (openai/anthropic) based on the model name.
+	client, err := router.New(*model, *baseURL, apiKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	caller := agents.NewLlmCaller(client, router.PricingFor(*model))
 
 	registry := tools.NewRegistry()
 	mustRegister(registry, readfile.New())
@@ -92,40 +95,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "opendev-tui:", err)
 		os.Exit(1)
 	}
-}
-
-// pricingFor returns Pricing for known models. Unknown models fall
-// back to zero Pricing — token counts still flow, cost stays $0.
-// The model name is matched as a prefix to handle "gpt-4o-2024-08-06"
-// style aliases.
-//
-// Duplicated from cmd/opendev/main.go on purpose. When a third
-// binary wants this table, lift it to internal/cost/pricing/ or
-// similar.
-func pricingFor(model string) cost.Pricing {
-	table := []struct {
-		prefix  string
-		pricing cost.Pricing
-	}{
-		{"gpt-4o-mini", cost.Pricing{InputPricePerMillion: 0.15, OutputPricePerMillion: 0.60}},
-		{"gpt-4o", cost.Pricing{InputPricePerMillion: 2.50, OutputPricePerMillion: 10.00}},
-		{"gpt-4-turbo", cost.Pricing{InputPricePerMillion: 10.00, OutputPricePerMillion: 30.00}},
-		{"gpt-3.5-turbo", cost.Pricing{InputPricePerMillion: 0.50, OutputPricePerMillion: 1.50}},
-	}
-	for _, entry := range table {
-		if startsWith(model, entry.prefix) {
-			return entry.pricing
-		}
-	}
-	return cost.Pricing{}
-}
-
-// startsWith is a tiny prefix check pulled out so this file doesn't
-// import "strings" only for HasPrefix. Same intent as
-// strings.HasPrefix; avoids the import for clarity in a thin glue
-// file.
-func startsWith(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
 // mustRegister fails fast on registry-wiring bugs. We only call this
