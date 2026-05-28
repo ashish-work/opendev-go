@@ -605,6 +605,293 @@ func TestProcessResponsePhase_TrackerPassesThrough(t *testing.T) {
 	}
 }
 
+// newExecuteTestRig builds a *ReactLoop with a tool registry plus
+// the given tool, and a *PhaseContext primed with the given
+// LastResponse so executeSequentialPhase has something to dispatch.
+func newExecuteTestRig(t *testing.T, tool tools.Tool, lastResp provider.Response) (*ReactLoop, *PhaseContext) {
+	t.Helper()
+	reg := tools.NewRegistry()
+	if tool != nil {
+		if err := reg.Register(tool); err != nil {
+			t.Fatalf("register tool: %v", err)
+		}
+	}
+	loop := &ReactLoop{
+		Registry: reg,
+		Config:   Config{SystemPrompt: "system prompt"},
+	}
+	history := []provider.Message{
+		SystemMessage("system prompt"),
+		UserMessage("hello"),
+	}
+	pc := NewPhaseContext(
+		&history,
+		cost.Tracker{CallCount: 4},
+		budget.New(0),
+		doomloop.New(),
+		tools.ToolContext{WorkingDir: "/tmp"},
+		nil,
+		"system prompt",
+	)
+	pc.Iter = 3
+	pc.LastResponse = lastResp
+	return loop, pc
+}
+
+func TestExecuteSequentialPhase_EmptyToolCallsContinues(t *testing.T) {
+	loop, pc := newExecuteTestRig(t, nil, provider.Response{})
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Errorf("Kind = %s, want continue (no tools to dispatch)", action.Kind)
+	}
+	if got := len(*pc.History); got != 2 {
+		t.Errorf("history len = %d, want 2 (unchanged)", got)
+	}
+}
+
+func TestExecuteSequentialPhase_SingleSuccessfulDispatchAppendsToolResult(t *testing.T) {
+	tool := &fakeTool{
+		name:   "foo",
+		desc:   "foo tool",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "tool said hi", Success: true}, nil
+		},
+	}
+	resp := provider.Response{
+		ToolCalls: []provider.ToolCall{{ID: "c1", Name: "foo"}},
+	}
+	loop, pc := newExecuteTestRig(t, tool, resp)
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3 (one tool result appended)", got)
+	}
+	last := (*pc.History)[2]
+	if last.Role != "tool" {
+		t.Errorf("appended role = %q, want tool", last.Role)
+	}
+	if last.ToolCallID != "c1" {
+		t.Errorf("appended ToolCallID = %q, want c1", last.ToolCallID)
+	}
+	if last.Name != "foo" {
+		t.Errorf("appended Name = %q, want foo", last.Name)
+	}
+	if tool.calls != 1 {
+		t.Errorf("tool.calls = %d, want 1", tool.calls)
+	}
+}
+
+func TestExecuteSequentialPhase_MultipleToolsDispatchedInOrder(t *testing.T) {
+	dispatched := []string{}
+	makeTool := func(name string) *fakeTool {
+		return &fakeTool{
+			name:   name,
+			schema: json.RawMessage(`{"type":"object"}`),
+			exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+				dispatched = append(dispatched, name)
+				return tools.ToolResult{Output: name + "-result", Success: true}, nil
+			},
+		}
+	}
+	// Register both tools individually since the rig's helper only
+	// takes one.
+	reg := tools.NewRegistry()
+	for _, n := range []string{"alpha", "beta"} {
+		if err := reg.Register(makeTool(n)); err != nil {
+			t.Fatalf("register %s: %v", n, err)
+		}
+	}
+	loop := &ReactLoop{Registry: reg, Config: Config{SystemPrompt: "sys"}}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.LastResponse = provider.Response{
+		ToolCalls: []provider.ToolCall{
+			{ID: "c1", Name: "alpha"},
+			{ID: "c2", Name: "beta"},
+		},
+	}
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if len(dispatched) != 2 || dispatched[0] != "alpha" || dispatched[1] != "beta" {
+		t.Errorf("dispatch order = %v, want [alpha beta]", dispatched)
+	}
+	if got := len(*pc.History); got != 4 {
+		t.Fatalf("history len = %d, want 4 (two tool results appended)", got)
+	}
+	if (*pc.History)[2].ToolCallID != "c1" || (*pc.History)[3].ToolCallID != "c2" {
+		t.Errorf("appended order wrong: [%s, %s]",
+			(*pc.History)[2].ToolCallID, (*pc.History)[3].ToolCallID)
+	}
+}
+
+func TestExecuteSequentialPhase_ToolDomainFailureIsObservationNotError(t *testing.T) {
+	// Tool returns Success: false — that's a domain failure the
+	// model should react to, NOT an infrastructure error. Phase
+	// returns Continue; result still appended.
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "", Error: "not found", Success: false}, nil
+		},
+	}
+	resp := provider.Response{
+		ToolCalls: []provider.ToolCall{{ID: "c1", Name: "foo"}},
+	}
+	loop, pc := newExecuteTestRig(t, tool, resp)
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Errorf("Kind = %s, want continue (Success:false is observation, not error)", action.Kind)
+	}
+	if got := len(*pc.History); got != 3 {
+		t.Errorf("history len = %d, want 3 (failed result still appended)", got)
+	}
+}
+
+func TestExecuteSequentialPhase_InfrastructureErrorReturnsErrToolExec(t *testing.T) {
+	// Tool's Execute returns an error (infrastructure failure) →
+	// phase returns Return with ErrToolExec wrapping.
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{}, errors.New("disk on fire")
+		},
+	}
+	resp := provider.Response{
+		ToolCalls: []provider.ToolCall{{ID: "c1", Name: "foo"}},
+	}
+	loop, pc := newExecuteTestRig(t, tool, resp)
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionReturn {
+		t.Fatalf("Kind = %s, want return", action.Kind)
+	}
+	if !errors.Is(action.Err, ErrToolExec) {
+		t.Errorf("Err = %v, want chain containing ErrToolExec", action.Err)
+	}
+	if !contains(action.Err.Error(), "foo") {
+		t.Errorf("error %q should name the failing tool", action.Err)
+	}
+}
+
+func TestExecuteSequentialPhase_UnknownToolFromRegistryReturnsErrToolExec(t *testing.T) {
+	// ToolCalls references a tool the registry doesn't have →
+	// Dispatch returns an error → phase wraps as ErrToolExec.
+	resp := provider.Response{
+		ToolCalls: []provider.ToolCall{{ID: "c1", Name: "nonexistent"}},
+	}
+	loop, pc := newExecuteTestRig(t, nil, resp) // no tools registered
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionReturn {
+		t.Fatalf("Kind = %s, want return", action.Kind)
+	}
+	if !errors.Is(action.Err, ErrToolExec) {
+		t.Errorf("Err = %v, want chain containing ErrToolExec", action.Err)
+	}
+}
+
+func TestExecuteSequentialPhase_TrackerPassesThroughOnSuccess(t *testing.T) {
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+	resp := provider.Response{ToolCalls: []provider.ToolCall{{ID: "c1", Name: "foo"}}}
+	loop, pc := newExecuteTestRig(t, tool, resp)
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Tracker.CallCount != 4 {
+		t.Errorf("Tracker.CallCount = %d, want 4 (preserved through phase)",
+			action.Tracker.CallCount)
+	}
+}
+
+func TestHandleCompletionPhase_NoneVerdictDoesNothing(t *testing.T) {
+	loop, pc := newExecuteTestRig(t, nil, provider.Response{})
+	pc.DoomLoopAction = doomloop.None
+
+	before := len(*pc.History)
+	action := loop.handleCompletionPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Errorf("Kind = %s, want continue", action.Kind)
+	}
+	if len(*pc.History) != before {
+		t.Errorf("history len = %d, want %d (no append on None)",
+			len(*pc.History), before)
+	}
+}
+
+func TestHandleCompletionPhase_RedirectAppendsSystemMessage(t *testing.T) {
+	loop, pc := newExecuteTestRig(t, nil, provider.Response{})
+	pc.DoomLoopAction = doomloop.Redirect
+	pc.DoomLoopWarning = "you are repeating yourself"
+	pc.DoomLoopRecovery = "try a different approach"
+
+	action := loop.handleCompletionPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	last := (*pc.History)[len(*pc.History)-1]
+	if last.Role != "system" {
+		t.Errorf("appended role = %q, want system", last.Role)
+	}
+	if !contains(last.Content[0].Text, "repeating") {
+		t.Errorf("warning text missing: %q", last.Content[0].Text)
+	}
+	if !contains(last.Content[0].Text, "different approach") {
+		t.Errorf("recovery text missing: %q", last.Content[0].Text)
+	}
+}
+
+func TestHandleCompletionPhase_NotifyAppendsSystemMessage(t *testing.T) {
+	loop, pc := newExecuteTestRig(t, nil, provider.Response{})
+	pc.DoomLoopAction = doomloop.Notify
+	pc.DoomLoopWarning = "stop"
+	pc.DoomLoopRecovery = "no really stop"
+
+	action := loop.handleCompletionPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Errorf("Kind = %s, want continue", action.Kind)
+	}
+	last := (*pc.History)[len(*pc.History)-1]
+	if last.Role != "system" {
+		t.Errorf("appended role = %q, want system", last.Role)
+	}
+}
+
+func TestHandleCompletionPhase_ForceStopDoesNotAppend(t *testing.T) {
+	// ForceStop shouldn't reach handle_completion (process_response
+	// returns first), but if it does we don't double-append the
+	// warning. The phase just returns Continue with no append.
+	loop, pc := newExecuteTestRig(t, nil, provider.Response{})
+	pc.DoomLoopAction = doomloop.ForceStop
+	pc.DoomLoopWarning = "stop"
+
+	before := len(*pc.History)
+	action := loop.handleCompletionPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Errorf("Kind = %s, want continue", action.Kind)
+	}
+	if len(*pc.History) != before {
+		t.Errorf("ForceStop should not append in handle_completion; len = %d, want %d",
+			len(*pc.History), before)
+	}
+}
+
 // contains is a tiny strings.Contains alias kept local so this file
 // doesn't import "strings" just for one check.
 func contains(s, substr string) bool {

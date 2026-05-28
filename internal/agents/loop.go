@@ -2,7 +2,6 @@ package agents
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/ashish-work/opendev-go/internal/agents/doomloop"
 	"github.com/ashish-work/opendev-go/internal/budget"
@@ -120,87 +119,52 @@ func (l *ReactLoop) RunWithStream(
 		SystemMessage(l.Config.SystemPrompt),
 		UserMessage(userTask),
 	}
-	tracker := cost.Tracker{}
-	cal := budget.New(l.Config.MaxContextTokens)
-	detector := doomloop.New()
-	tctx := tools.ToolContext{WorkingDir: l.Config.WorkingDir}
 
-	// snapshot builds the Result.Budget for any return path. The
-	// `history` slice is captured by reference, so the snapshot
-	// reflects whatever was in history at the point of return.
-	snapshot := func() budget.Snapshot {
-		return cal.Snapshot(history, l.Config.SystemPrompt)
+	// One PhaseContext for the whole turn. Phases mutate it across
+	// iterations — Tracker and Calibrator carry forward via
+	// reassignment-after-immutable-update; History is a pointer
+	// indirected through the local slice so appends across phases
+	// and iterations all land in the same backing array.
+	//
+	// The per-iteration ephemeral fields (LastResponse, DoomLoop*)
+	// are written before they're read every iteration: llm_call
+	// writes LastResponse before process_response reads it;
+	// process_response writes the DoomLoop* fields before
+	// handle_completion reads them. Stale values from the previous
+	// iteration are always overwritten, so no reset is needed at
+	// the top of each iteration.
+	pc := &PhaseContext{
+		History:      &history,
+		Tracker:      cost.Tracker{},
+		Calibrator:   budget.New(l.Config.MaxContextTokens),
+		Detector:     doomloop.New(),
+		ToolCtx:      tools.ToolContext{WorkingDir: l.Config.WorkingDir},
+		StreamSink:   sink,
+		SystemPrompt: l.Config.SystemPrompt,
 	}
 
-	// The loop runs unbounded; safetyPhase enforces the iteration
-	// cap and the inter-iteration ctx-cancel check. PhaseContext is
-	// constructed fresh each pass around the existing locals;
-	// subsequent commits will migrate the body into its own phases
-	// and the locals will gradually disappear.
+	// Unbounded loop; safetyPhase enforces the iteration cap and
+	// the inter-iteration ctx-cancel check. Each pass is a clean
+	// orchestration of the five phases. Every phase has the same
+	// signature, the same Continue/Return contract, and the same
+	// Result/Err shape on exit.
 	for iter := 1; ; iter++ {
-		pc := &PhaseContext{
-			History:      &history,
-			Tracker:      tracker,
-			Calibrator:   cal,
-			Detector:     detector,
-			Iter:         iter,
-			ToolCtx:      tctx,
-			StreamSink:   sink,
-			SystemPrompt: l.Config.SystemPrompt,
-		}
-		if action := l.safetyPhase(ctx, pc); action.Kind == LoopActionReturn {
-			return action.Result, action.Tracker, action.Err
-		}
+		pc.Iter = iter
 
-		// LLM-call phase: build request, dispatch via Call/Stream,
-		// update the calibrator. The phase stashes the response on
-		// pc.LastResponse and updates pc.Tracker + pc.Calibrator in
-		// place; we sync back to the still-inline locals here. Once
-		// process_response and execute_sequential land (#20/#21),
-		// the locals disappear and pc becomes the single source of
-		// truth.
-		if action := l.llmCallPhase(ctx, pc); action.Kind == LoopActionReturn {
-			return action.Result, action.Tracker, action.Err
+		if a := l.safetyPhase(ctx, pc); a.Kind == LoopActionReturn {
+			return a.Result, a.Tracker, a.Err
 		}
-		tracker = pc.Tracker
-		cal = pc.Calibrator
-		resp := pc.LastResponse
-
-		// process_response phase: makes the no-tool-call vs
-		// tool-call decision, runs the doom-loop ForceStop check,
-		// commits the assistant message to history on the dispatch
-		// path. Stashes the doom-loop verdict on pc so the
-		// still-inline Redirect / Notify path below can read it
-		// without re-calling the detector.
-		if action := l.processResponsePhase(ctx, pc); action.Kind == LoopActionReturn {
-			return action.Result, action.Tracker, action.Err
+		if a := l.llmCallPhase(ctx, pc); a.Kind == LoopActionReturn {
+			return a.Result, a.Tracker, a.Err
 		}
-		action := pc.DoomLoopAction
-		warning := pc.DoomLoopWarning
-		recovery := pc.DoomLoopRecovery
-
-		// Dispatch each tool call in order. Tool-domain failures
-		// (Success: false ToolResult) flow into history as observations
-		// the model will react to. Infrastructure errors (registry
-		// invariants, ctx cancellation surfacing from the tool) bubble
-		// out and end the loop.
-		for _, call := range resp.ToolCalls {
-			result, dispatchErr := l.Registry.Dispatch(
-				ctx, tctx, call.Name, ensureJSON(call.Arguments),
-			)
-			if dispatchErr != nil {
-				return Result{Messages: history, Budget: snapshot()}, tracker,
-					fmt.Errorf("%w: %s: %v", ErrToolExec, call.Name, dispatchErr)
-			}
-			history = append(history, ToolResultMessage(call.ID, call.Name, result))
+		if a := l.processResponsePhase(ctx, pc); a.Kind == LoopActionReturn {
+			return a.Result, a.Tracker, a.Err
 		}
-
-		// Doom-loop Redirect/Notify: append the warning + recovery
-		// hint AFTER all tool results. Inserting before would break
-		// OpenAI's tool_call → tool_response pairing contract (the
-		// REPL hit a 400 from exactly this ordering bug).
-		if action == doomloop.Redirect || action == doomloop.Notify {
-			history = append(history, SystemMessage(warning+"\n\n"+recovery))
+		if a := l.executeSequentialPhase(ctx, pc); a.Kind == LoopActionReturn {
+			return a.Result, a.Tracker, a.Err
+		}
+		if a := l.handleCompletionPhase(ctx, pc); a.Kind == LoopActionReturn {
+			return a.Result, a.Tracker, a.Err
 		}
 	}
 }

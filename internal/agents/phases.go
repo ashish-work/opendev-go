@@ -245,3 +245,62 @@ func (l *ReactLoop) processResponsePhase(_ context.Context, pc *PhaseContext) Lo
 
 	return NewLoopActionContinue(pc.Tracker)
 }
+
+// executeSequentialPhase dispatches the assistant's tool calls in
+// order and appends a ToolResultMessage for each. Two failure
+// classes:
+//
+//   - Tool-domain failures (Success: false ToolResult) — these flow
+//     into history as observations the model will react to. The
+//     phase does NOT return Return for these; the model gets to
+//     try again.
+//
+//   - Infrastructure failures (Registry.Dispatch returns an error:
+//     unknown tool, ctx cancellation surfacing from the tool,
+//     panic in the registry) — these bubble out as ErrToolExec.
+//     The name of the tool that failed is folded into the error so
+//     debugging starts with the right suspect.
+//
+// Dispatched in order. v1 doesn't parallelize tool calls; Phase 7
+// adds parallel dispatch for the homogeneous-spawn_subagent batch
+// case but leaves the sequential path here as the default.
+func (l *ReactLoop) executeSequentialPhase(ctx context.Context, pc *PhaseContext) LoopAction {
+	for _, call := range pc.LastResponse.ToolCalls {
+		result, dispatchErr := l.Registry.Dispatch(
+			ctx, pc.ToolCtx, call.Name, ensureJSON(call.Arguments),
+		)
+		if dispatchErr != nil {
+			return NewLoopActionReturn(
+				Result{
+					Messages: *pc.History,
+					Budget:   pc.Snapshot(),
+				},
+				fmt.Errorf("%w: %s: %v", ErrToolExec, call.Name, dispatchErr),
+				pc.Tracker,
+			)
+		}
+		pc.AppendMessage(ToolResultMessage(call.ID, call.Name, result))
+	}
+	return NewLoopActionContinue(pc.Tracker)
+}
+
+// handleCompletionPhase is the post-dispatch finalizer. Currently it
+// has one job: on doom-loop Redirect or Notify, append the warning +
+// recovery hint as a system message so the next LLM call sees it.
+// The append happens AFTER all tool results because inserting before
+// would break OpenAI's tool_call → tool_response pairing contract.
+//
+// This phase exists as a separate landing zone for hooks (Phase 6
+// PostToolUse, Phase 7 SubagentStop) that fire after dispatch but
+// before the next iteration's safety check. Splitting it out now
+// keeps the hook integrations surgical when they land.
+//
+// ForceStop never reaches here — process_response would have
+// returned LoopActionReturn before dispatch. The phase doesn't
+// special-case it because the check would be unreachable.
+func (l *ReactLoop) handleCompletionPhase(_ context.Context, pc *PhaseContext) LoopAction {
+	if pc.DoomLoopAction == doomloop.Redirect || pc.DoomLoopAction == doomloop.Notify {
+		pc.AppendMessage(SystemMessage(pc.DoomLoopWarning + "\n\n" + pc.DoomLoopRecovery))
+	}
+	return NewLoopActionContinue(pc.Tracker)
+}
