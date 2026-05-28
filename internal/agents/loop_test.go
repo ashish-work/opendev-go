@@ -38,6 +38,13 @@ func (f *fakeProvider) Call(_ context.Context, req provider.Request) (provider.R
 	return f.responses[i], nil
 }
 
+// Stream satisfies provider.Provider. Loop tests don't exercise the
+// streaming path; return a setup error so any test that accidentally
+// reaches for it fails loudly.
+func (f *fakeProvider) Stream(_ context.Context, _ provider.Request) (<-chan provider.StreamEvent, error) {
+	return nil, fmt.Errorf("fakeProvider: streaming not implemented in tests")
+}
+
 // fakeTool is a scripted Tool. Records every Execute call.
 type fakeTool struct {
 	name   string

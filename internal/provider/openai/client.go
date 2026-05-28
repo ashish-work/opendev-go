@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -106,6 +107,21 @@ func (c *Client) Call(ctx context.Context, req provider.Request) (provider.Respo
 	}
 
 	return c.Adapter.ParseResponse(respBody)
+}
+
+// errStreamNotImplemented is the setup-error returned by Stream until
+// the SSE implementation lands. Defined as a sentinel so tests can
+// match on identity rather than substring, and so the replacement
+// commit deletes one named symbol rather than refactoring a string
+// literal scattered across files.
+var errStreamNotImplemented = errors.New("openai: streaming not yet implemented")
+
+// Stream implements provider.Provider. Returns (nil, errStreamNotImplemented)
+// as a placeholder; the real SSE-parsing implementation lands in the
+// next commit. Kept in client.go alongside Call so the diff that
+// activates streaming is a single-method replacement.
+func (c *Client) Stream(_ context.Context, _ provider.Request) (<-chan provider.StreamEvent, error) {
+	return nil, errStreamNotImplemented
 }
 
 // HTTPError is returned by Call for any non-2xx response. Use errors.As

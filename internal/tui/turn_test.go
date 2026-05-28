@@ -41,6 +41,13 @@ func (s stubProvider) Call(ctx context.Context, req provider.Request) (provider.
 	return s.response, nil
 }
 
+// Stream satisfies provider.Provider. The TUI tests don't exercise
+// streaming yet (the loop still uses Call) — return a setup error so
+// any accidental Stream call in a future test fails fast and visibly.
+func (s stubProvider) Stream(_ context.Context, _ provider.Request) (<-chan provider.StreamEvent, error) {
+	return nil, errors.New("stubProvider: streaming not implemented in tests")
+}
+
 // newTestLoop builds a *agents.ReactLoop wired against the given stub
 // provider. Used by both turn_test and tui_test (same package — these
 // helpers are local to the test build only).

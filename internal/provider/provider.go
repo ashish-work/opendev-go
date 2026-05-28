@@ -18,9 +18,18 @@ import (
 // Provider is the contract every LLM adapter implements. The agent loop
 // holds one Provider and never knows which vendor it's talking to.
 //
-// Kept intentionally small (2 methods) — see the Go rule "small
-// interfaces, 1-3 methods". Streaming will be added later as a separate
-// optional interface tools can type-assert for, not bolted onto Provider.
+// Three methods, each serving a distinct consumer:
+//   - Name: logs, metrics, provider-specific branching.
+//   - Call: synchronous, full-response — used by paths where streaming
+//     adds no value (summarization passes, smoke tests, anywhere the
+//     caller just wants the final message).
+//   - Stream: token-level output — used by interactive UIs that want to
+//     paint deltas as they arrive and by mid-stream cancellation flows.
+//
+// Both Call and Stream live on Provider rather than on a separate
+// optional interface because every real provider supports both modes
+// of the same underlying API. Splitting would force callers into
+// `if streamer, ok := p.(Streamer); ok { … } else { … }` ceremony.
 type Provider interface {
 	// Name returns the provider's identifier (e.g. "openai", "anthropic").
 	// Used for logging and provider-specific behavior in the loop.
@@ -29,6 +38,40 @@ type Provider interface {
 	// Call sends a synchronous request and returns the full response.
 	// Honors ctx for cancellation and timeouts.
 	Call(ctx context.Context, req Request) (Response, error)
+
+	// Stream sends a request and returns a channel of StreamEvents
+	// describing token-level output. The implementation runs the
+	// network read in a goroutine and writes events to the channel as
+	// they arrive.
+	//
+	// Failure modes are split across the two return values:
+	//
+	//   - Setup errors (invalid request, ctx already cancelled, auth
+	//     check failed, initial connection refused) return
+	//     (nil, err). The channel is never created.
+	//
+	//   - Mid-stream errors (connection drop, malformed event, parse
+	//     failure) arrive on the channel as a StreamEventError, after
+	//     which the channel is closed. The function's error return
+	//     stays nil because the setup phase succeeded.
+	//
+	// Channel close contract (binding on every implementation):
+	//
+	//   - The adapter closes the channel exactly once, immediately
+	//     after emitting either StreamEventDone (success) or
+	//     StreamEventError (failure).
+	//
+	//   - The caller MUST drain the channel until it is closed, even
+	//     when cancelling via ctx. Failing to drain leaves the
+	//     producer goroutine blocked on send, which leaks until the
+	//     process exits. The conventional pattern is
+	//     `for ev := range events { … }` — the range exits cleanly on
+	//     close.
+	//
+	// ctx flows through the HTTP transport, so cancellation aborts the
+	// network read and terminates the goroutine. The channel still
+	// closes after that, per the contract above.
+	Stream(ctx context.Context, req Request) (<-chan StreamEvent, error)
 }
 
 // ContentKind tags the variant of a ContentBlock.

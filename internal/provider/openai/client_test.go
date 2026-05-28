@@ -207,6 +207,24 @@ func TestNewClientDefaults(t *testing.T) {
 	}
 }
 
+// Stream is a temporary stub until the SSE-streaming implementation
+// lands in the next commit. This test pins that contract — returns a
+// nil channel and a non-nil error — and will be replaced by real
+// streaming-flow tests when the implementation arrives.
+func TestClientStream_StubReturnsError(t *testing.T) {
+	c := NewClient("test-key")
+	ch, err := c.Stream(context.Background(), provider.Request{Model: "gpt-4o"})
+	if err == nil {
+		t.Fatal("expected error from streaming stub, got nil")
+	}
+	if ch != nil {
+		t.Errorf("expected nil channel from streaming stub, got %v", ch)
+	}
+	if !errors.Is(err, errStreamNotImplemented) {
+		t.Errorf("err = %v, want errStreamNotImplemented", err)
+	}
+}
+
 func TestClientCall_NilHTTPClientFallsBackToDefault(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
