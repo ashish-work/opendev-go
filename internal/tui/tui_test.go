@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -209,6 +210,121 @@ func TestView_EmptyWhenQuitting(t *testing.T) {
 	m.quitting = true
 	if out := m.View(); out != "" {
 		t.Errorf("View() should be empty when quitting, got %q", out)
+	}
+}
+
+func TestUpdate_CtrlTTogglesToolsExpanded(t *testing.T) {
+	m := initialModel(nil)
+	m, _ = applyWindowSize(m, 100, 30)
+	if m.toolsExpanded {
+		t.Fatalf("toolsExpanded should default to false")
+	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	got := next.(model)
+	if !got.toolsExpanded {
+		t.Errorf("Ctrl-T should flip toolsExpanded to true")
+	}
+	// Second press flips back.
+	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	got = next.(model)
+	if got.toolsExpanded {
+		t.Errorf("second Ctrl-T should flip toolsExpanded back to false")
+	}
+}
+
+func TestUpdate_PageKeysScrollViewport(t *testing.T) {
+	// Set up a model with enough content that the viewport scrolls,
+	// then verify PgUp moves the YOffset up. Specifics:
+	//   - viewport height = 5 lines
+	//   - viewport content = 20 lines
+	//   - GotoBottom puts YOffset at max (>0)
+	//   - PgUp should reduce YOffset
+	m := initialModel(nil)
+	m, _ = applyWindowSize(m, 80, 10)
+	// height=10 → viewport.Height = 10 - inputHeight(5) - divider(1) = 4
+	// fill with 30 distinct lines so scroll position is meaningful
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line %02d", i)
+	}
+	m.viewport.SetContent(strings.Join(lines, "\n"))
+	m.viewport.GotoBottom()
+	startOffset := m.viewport.YOffset
+	if startOffset == 0 {
+		t.Fatalf("setup: GotoBottom should produce non-zero YOffset with overflow content")
+	}
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	got := next.(model)
+	if got.viewport.YOffset >= startOffset {
+		t.Errorf("PgUp should decrease YOffset; before=%d after=%d", startOffset, got.viewport.YOffset)
+	}
+
+	// Now PgDown should bring it back (within the same range).
+	next2, _ := got.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	got2 := next2.(model)
+	if got2.viewport.YOffset <= got.viewport.YOffset {
+		t.Errorf("PgDown should increase YOffset; before=%d after=%d",
+			got.viewport.YOffset, got2.viewport.YOffset)
+	}
+}
+
+func TestUpdate_PageKeysDoNotTouchTextarea(t *testing.T) {
+	// PgUp/PgDn should be intercepted before reaching the textarea.
+	// Verify by typing content first, then sending PgUp — content
+	// should be unchanged (no textarea-side effect).
+	m := initialModel(nil)
+	m, _ = applyWindowSize(m, 80, 30)
+	m = typeInto(m, "do not touch me")
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	got := next.(model)
+	if got.textarea.Value() != "do not touch me" {
+		t.Errorf("PgUp should not modify textarea content, got %q", got.textarea.Value())
+	}
+}
+
+func TestUpdate_CtrlHomeAndCtrlEndJumpToTopAndBottom(t *testing.T) {
+	m := initialModel(nil)
+	m, _ = applyWindowSize(m, 80, 10)
+	lines := make([]string, 30)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line %02d", i)
+	}
+	m.viewport.SetContent(strings.Join(lines, "\n"))
+	m.viewport.GotoBottom()
+
+	// Ctrl-Home → top.
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlHome})
+	if next.(model).viewport.YOffset != 0 {
+		t.Errorf("Ctrl-Home should put YOffset = 0, got %d", next.(model).viewport.YOffset)
+	}
+
+	// Ctrl-End → bottom.
+	next2, _ := next.(model).Update(tea.KeyMsg{Type: tea.KeyCtrlEnd})
+	if next2.(model).viewport.YOffset == 0 {
+		t.Errorf("Ctrl-End should put YOffset > 0 with overflow content")
+	}
+}
+
+func TestUpdate_CtrlTRepaintsViewport(t *testing.T) {
+	// With a tool message in history, toggling toolsExpanded should
+	// change the rendered viewport content (different hint visibility,
+	// different body length). Simplest check: rendered output differs
+	// before vs after Ctrl-T.
+	m := initialModel(nil)
+	m, _ = applyWindowSize(m, 80, 30)
+	m.history = []viewMessage{
+		{role: roleTool, toolName: "bash", content: strings.Join(
+			[]string{"a", "b", "c", "d", "e"}, "\n")},
+	}
+	m.viewport.SetContent(m.renderHistory())
+	collapsedOut := m.View()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	expandedOut := next.(model).View()
+
+	if collapsedOut == expandedOut {
+		t.Errorf("Ctrl-T should change rendered output when a tool message is present")
 	}
 }
 

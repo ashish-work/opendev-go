@@ -88,6 +88,17 @@ type model struct {
 	// thinking, cleared when the turn completes.
 	turnCancel context.CancelFunc
 
+	// toolsExpanded selects how every tool message in history is
+	// rendered. False (default) collapses each tool card to its
+	// first few lines plus a "(… N more)" hint; true expands them
+	// all to full content. Toggled by Ctrl-T.
+	//
+	// Single global flag rather than per-card state: simpler to
+	// implement and tests, demonstrates the collapse pattern
+	// cleanly. Per-card focus + Tab cycling is a clean follow-up
+	// that builds on this without rewriting it.
+	toolsExpanded bool
+
 	// quitting flips true when a global-quit key arrives; View
 	// returns "" to let the alt screen clean up.
 	quitting bool
@@ -99,7 +110,7 @@ type model struct {
 // start, so the user never sees a zero-sized panel.
 func initialModel(loop *agents.ReactLoop) model {
 	ta := textarea.New()
-	ta.Placeholder = "Type a message — Ctrl-D submits, Ctrl-C cancels/quits"
+	ta.Placeholder = "Type — Ctrl-D submit · Ctrl-T toggle tool details · PgUp/PgDn scroll · Ctrl-C cancel/quit"
 	ta.CharLimit = 0 // unlimited; we cap effective size via the agent's token budget
 	ta.SetHeight(inputHeight)
 	ta.Focus()
@@ -165,6 +176,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.quitting = true
 			return m, tea.Quit
+
+		case "ctrl+t":
+			// Toggle the global "expand all tool cards" flag and
+			// repaint. The toggle is allowed at any time — during a
+			// turn it just affects the visual state of completed
+			// tool messages; while idle it's a pure UX preference.
+			m.toolsExpanded = !m.toolsExpanded
+			m.viewport.SetContent(m.renderHistory())
+			return m, nil
+
+		case "pgup", "pgdown":
+			// Scroll the viewport ONLY, not the textarea. Without
+			// this intercept the keys would forward to both widgets
+			// (the default below) and the textarea would jump its
+			// cursor by page in lockstep — split attention. Lets
+			// the user scroll up through history (e.g. to see a
+			// tool card that scrolled off the top of the screen)
+			// without losing their place in the input box.
+			var vpCmd tea.Cmd
+			m.viewport, vpCmd = m.viewport.Update(msg)
+			return m, vpCmd
+
+		case "ctrl+home":
+			// Jump to the top of the viewport (start of conversation).
+			// Useful when the model dumped a huge response and you
+			// want to read it from the beginning. Ctrl-Home not
+			// plain Home because Home is textarea's start-of-line.
+			m.viewport.GotoTop()
+			return m, nil
+
+		case "ctrl+end":
+			// Jump to the bottom of the viewport (latest content).
+			// Mirror of Ctrl-Home for completeness.
+			m.viewport.GotoBottom()
+			return m, nil
 
 		case "ctrl+d":
 			// Reject a submit while a turn is already running. The user
@@ -270,7 +316,7 @@ func (m model) renderHistory() string {
 	}
 	rendered := make([]string, 0, len(m.history)+1)
 	for _, msg := range m.history {
-		rendered = append(rendered, msg.render(m.viewport.Width))
+		rendered = append(rendered, msg.render(m.viewport.Width, m.toolsExpanded))
 	}
 	if m.thinking {
 		rendered = append(rendered, thinkingStyle.Render("⋯ thinking — Ctrl-C to cancel"))

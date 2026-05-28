@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ashish-work/opendev-go/internal/provider"
@@ -85,17 +88,27 @@ func roleStyle(role messageRole, toolName string) (string, lipgloss.Style, lipgl
 // tiny terminals — text wrapped to 3 columns is unreadable.
 const minBodyWidth = 10
 
+// collapsedToolLines is how many lines of tool output we show before
+// truncating with a "(… N more lines)" hint. Three is enough to see
+// what kind of output it is without burying the conversation.
+const collapsedToolLines = 3
+
 // render produces the styled multi-line output for one message.
-// width is the viewport's visible width; the body wraps to that
-// width (with a minimum floor). Output is "header\nbody" where the
-// header is the role label and the body is the content text.
+// width is the viewport's visible width; the body wraps to that width
+// (with a minimum floor). expanded only affects tool messages — they
+// render as bordered cards that show the first collapsedToolLines of
+// content by default, and the full body when expanded.
 //
-// The leading "▎ " on the header is a thick left vertical bar — a
-// Slack/Discord-style speaker indicator. Header-only, not duplicated
-// on body lines, because doing the bar-per-line trick correctly
-// requires splitting the wrapped output and re-prefixing, which is
-// more rendering plumbing than the visual win justifies.
-func (m viewMessage) render(width int) string {
+// For non-tool messages the leading "▎ " is a Slack/Discord-style
+// speaker bar, header-only (the wrapped body sits below without the
+// bar continuing — implementing per-line bars cleanly with the
+// lipgloss wrap is more plumbing than the visual win justifies).
+// Tool messages drop the bar; the bordered card is their visual
+// marker instead.
+func (m viewMessage) render(width int, expanded bool) string {
+	if m.role == roleTool {
+		return m.renderTool(width, expanded)
+	}
 	header, headerStyle, bodyStyle := roleStyle(m.role, m.toolName)
 	if width < minBodyWidth {
 		width = minBodyWidth
@@ -103,6 +116,79 @@ func (m viewMessage) render(width int) string {
 	headerLine := headerStyle.Render("▎ " + header)
 	body := bodyStyle.Width(width).Render(m.content)
 	return headerLine + "\n" + body
+}
+
+// renderTool draws a tool message as a bordered card. The card's
+// border is rounded yellow (matching the tool role's accent color
+// throughout the TUI), padded one column on each side, sized to
+// total `width` so it slots into the viewport without overflow.
+//
+// Width math: the rounded border eats 2 columns (one per side) AND
+// the padding eats 2 more. Available content width inside the card
+// is therefore width - 4. We set lipgloss.Width on the OUTER card
+// style to width - 2; lipgloss treats that as "content area" and
+// adds the border outside. The 1-col padding on each side then
+// leaves width - 4 for the actual text. The math is unintuitive
+// the first time but consistent once you internalize it.
+func (m viewMessage) renderTool(width int, expanded bool) string {
+	if width < minBodyWidth+4 {
+		width = minBodyWidth + 4 // ensure the card has room for some content
+	}
+	// Border (1 col each side) is outside Width; padding (1 col each
+	// side) is inside Width. So cardWidth (the "content area" lipgloss
+	// sees) = width - 2 borders, and the actual text fits in
+	// cardWidth - 2 padding columns.
+	cardWidth := width - 2
+
+	headerText := "tool"
+	if m.toolName != "" {
+		headerText = "tool: " + m.toolName
+	}
+	headerLine := toolCardHeaderStyle.Render(headerText)
+
+	body := m.content
+	var extra int
+	if !expanded {
+		body, extra = truncateToLines(body, collapsedToolLines)
+	}
+	bodyLine := toolCardBodyStyle.Render(body)
+
+	parts := []string{headerLine, bodyLine}
+	if extra > 0 {
+		hint := fmt.Sprintf(
+			"(… %d more line%s — Ctrl-T to expand all tool details)",
+			extra, plural(extra),
+		)
+		parts = append(parts, toolCardHintStyle.Render(hint))
+	}
+
+	inner := strings.Join(parts, "\n")
+	return toolCardStyle.Width(cardWidth).Render(inner)
+}
+
+// truncateToLines returns the first `max` lines of s, plus the count
+// of lines that were dropped. When s fits within `max`, returns s
+// unchanged with extra=0. A max < 1 returns an empty preview and
+// reports every line as extra — defensive against bad callers.
+func truncateToLines(s string, max int) (preview string, extra int) {
+	if max < 1 {
+		if s == "" {
+			return "", 0
+		}
+		return "", strings.Count(s, "\n") + 1
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= max {
+		return s, 0
+	}
+	return strings.Join(lines[:max], "\n"), len(lines) - max
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // translateMessages converts a slice of provider.Message (the wire
@@ -195,4 +281,41 @@ var (
 			Foreground(lipgloss.Color("245")).
 			Italic(true).
 			PaddingLeft(2)
+)
+
+// Tool-card-specific styles. The card is a separate rendering path
+// from the plain user/assistant treatment, so it gets its own style
+// set instead of reusing the toolBodyStyle (which has PaddingLeft
+// that would double up with the card's own padding).
+var (
+	// toolCardStyle is the bordered box itself. Rounded corners +
+	// yellow border match the tool role's accent color used in the
+	// non-card path's header. Padding(0, 1) leaves one column of
+	// breathing room left and right of the content.
+	toolCardStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("220")).
+			Padding(0, 1)
+
+	// toolCardHeaderStyle is the header line INSIDE the card —
+	// "tool: <name>" in bold yellow. Stays distinct from the body
+	// so even a small card has a clear identifier at the top.
+	toolCardHeaderStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("220")).
+				Bold(true)
+
+	// toolCardBodyStyle is the tool's output text inside the card.
+	// Dimmer than body text (245 = mid gray) because tool output is
+	// reference material that shouldn't compete with the conversation.
+	// No italic — output is often code/paths and italics hurt
+	// readability for monospace content.
+	toolCardBodyStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("245"))
+
+	// toolCardHintStyle is the "(… N more — Ctrl-T to expand)" hint
+	// that appears only when content is truncated. Dimmer + italic
+	// so it reads as meta-instruction, not output.
+	toolCardHintStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("241")).
+				Italic(true)
 )
