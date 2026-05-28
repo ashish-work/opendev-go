@@ -132,16 +132,24 @@ func (l *ReactLoop) RunWithStream(
 		return cal.Snapshot(history, l.Config.SystemPrompt)
 	}
 
-	for iter := 1; iter <= l.Config.MaxIterations; iter++ {
-		// Ctx check at iteration top — catches cancellations between
-		// turns without waiting for the next LLM round-trip.
-		if err := ctx.Err(); err != nil {
-			return Result{
-					Messages:    history,
-					Interrupted: true,
-					Budget:      snapshot(),
-				}, tracker,
-				fmt.Errorf("%w: iter %d: %v", ErrInterrupted, iter, err)
+	// The loop runs unbounded; safetyPhase enforces the iteration
+	// cap and the inter-iteration ctx-cancel check. PhaseContext is
+	// constructed fresh each pass around the existing locals;
+	// subsequent commits will migrate the body into its own phases
+	// and the locals will gradually disappear.
+	for iter := 1; ; iter++ {
+		pc := &PhaseContext{
+			History:      &history,
+			Tracker:      tracker,
+			Calibrator:   cal,
+			Detector:     detector,
+			Iter:         iter,
+			ToolCtx:      tctx,
+			StreamSink:   sink,
+			SystemPrompt: l.Config.SystemPrompt,
+		}
+		if action := l.safetyPhase(ctx, pc); action.Kind == LoopActionReturn {
+			return action.Result, action.Tracker, action.Err
 		}
 
 		// Snapshot the request-side message count BEFORE the call —
@@ -260,9 +268,4 @@ func (l *ReactLoop) RunWithStream(
 			history = append(history, SystemMessage(warning+"\n\n"+recovery))
 		}
 	}
-
-	// Loop hit its iteration cap. Return the partial Result so callers
-	// can show the user what was happening up to the cap.
-	return Result{Messages: history, Budget: snapshot()}, tracker,
-		fmt.Errorf("%w (limit=%d)", ErrMaxIterations, l.Config.MaxIterations)
 }
