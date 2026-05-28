@@ -1,4 +1,4 @@
-package main
+package tui
 
 import (
 	"strings"
@@ -8,7 +8,7 @@ import (
 )
 
 // Bubble Tea's tea.Program blocks on real terminal I/O, which is
-// hostile to unit tests. We exercise the Model's Init/Update/View
+// hostile to unit tests. We exercise the model's Init/Update/View
 // contract directly — pure functions, easy to test — and verify the
 // interactive surface manually.
 
@@ -38,7 +38,7 @@ func TestInit_ReturnsBlinkCmd(t *testing.T) {
 func TestUpdate_WindowSizeMsgResizesWidgets(t *testing.T) {
 	m := initialModel()
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
-	got := next.(Model)
+	got := next.(model)
 	if got.width != 120 || got.height != 40 {
 		t.Errorf("dimensions not stored: width=%d height=%d", got.width, got.height)
 	}
@@ -56,7 +56,7 @@ func TestUpdate_TinyTerminalClampsViewport(t *testing.T) {
 	// viewport height should clamp to 0 instead of going negative.
 	m := initialModel()
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 3})
-	got := next.(Model)
+	got := next.(model)
 	if got.viewport.Height != 0 {
 		t.Errorf("viewport.Height = %d, want 0 (clamped)", got.viewport.Height)
 	}
@@ -65,7 +65,7 @@ func TestUpdate_TinyTerminalClampsViewport(t *testing.T) {
 func TestUpdate_CtrlCQuits(t *testing.T) {
 	m := initialModel()
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
-	if !next.(Model).quitting {
+	if !next.(model).quitting {
 		t.Errorf("Ctrl-C should set quitting=true")
 	}
 	if cmd == nil {
@@ -82,7 +82,7 @@ func TestUpdate_CtrlDSubmitsAndClears(t *testing.T) {
 	m = typeInto(m, "hello world")
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-	got := next.(Model)
+	got := next.(model)
 
 	if len(got.history) != 1 {
 		t.Fatalf("history len = %d, want 1", len(got.history))
@@ -103,7 +103,7 @@ func TestUpdate_CtrlDEmptyIsNoOp(t *testing.T) {
 	m, _ = applyWindowSize(m, 100, 30)
 	// No input typed. Submit anyway.
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-	got := next.(Model)
+	got := next.(model)
 	if len(got.history) != 0 {
 		t.Errorf("empty Ctrl-D should not append to history, got %d entries", len(got.history))
 	}
@@ -114,7 +114,7 @@ func TestUpdate_CtrlDWhitespaceIsNoOp(t *testing.T) {
 	m, _ = applyWindowSize(m, 100, 30)
 	m = typeInto(m, "   \n\t  ")
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-	got := next.(Model)
+	got := next.(model)
 	if len(got.history) != 0 {
 		t.Errorf("whitespace-only submit should be a no-op, got %d history entries", len(got.history))
 	}
@@ -126,7 +126,7 @@ func TestUpdate_MultipleSubmitsAccumulate(t *testing.T) {
 	for _, s := range []string{"first", "second", "third"} {
 		m = typeInto(m, s)
 		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-		m = next.(Model)
+		m = next.(model)
 	}
 	if len(m.history) != 3 {
 		t.Fatalf("history len = %d, want 3", len(m.history))
@@ -152,7 +152,7 @@ func TestView_RendersHistory(t *testing.T) {
 	m, _ = applyWindowSize(m, 100, 30)
 	m = typeInto(m, "test message")
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-	got := next.(Model).View()
+	got := next.(model).View()
 	if !strings.Contains(got, "test message") {
 		t.Errorf("View() should render history; got:\n%s", got)
 	}
@@ -180,9 +180,9 @@ func TestView_EmptyWhenQuitting(t *testing.T) {
 
 // applyWindowSize sends a WindowSizeMsg through Update so subsequent
 // assertions can rely on the widgets being properly dimensioned.
-func applyWindowSize(m Model, w, h int) (Model, tea.Cmd) {
+func applyWindowSize(m model, w, h int) (model, tea.Cmd) {
 	next, cmd := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
-	return next.(Model), cmd
+	return next.(model), cmd
 }
 
 // typeInto simulates the user typing a string into the textarea by
@@ -190,7 +190,7 @@ func applyWindowSize(m Model, w, h int) (Model, tea.Cmd) {
 // model-level Update path can't easily synthesize a multi-rune
 // KeyMsg, so we route around it for test setup — production keystroke
 // behavior is unchanged.
-func typeInto(m Model, s string) Model {
+func typeInto(m model, s string) model {
 	m.textarea.SetValue(s)
 	return m
 }

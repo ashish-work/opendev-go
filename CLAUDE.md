@@ -63,7 +63,8 @@ reading and writing code here.
 opendev-go/
 ├── go.mod
 ├── cmd/opendev/             # CLI entry point: REPL (v1; minimal surface)
-├── cmd/opendev-tui/         # CLI entry point: Bubble Tea TUI (v2 Phase 1.5+)
+├── cmd/opendev-tui/         # CLI entry point: Bubble Tea TUI — thin glue
+│                            #   that delegates to internal/tui
 ├── internal/
 │   ├── provider/            # Provider interface + normalized types
 │   │   └── openai/          # OpenAI-compatible Chat Completions adapter
@@ -76,6 +77,8 @@ opendev-go/
 │   ├── agents/              # ReAct loop, prompt composition, LLM caller
 │   │   ├── doomloop/        # cycle detector
 │   │   └── summarize/       # rule-based tool-result summarizer
+│   ├── tui/                 # Bubble Tea Model/Update/View (powers
+│   │                        #   cmd/opendev-tui — v2 Phase 1.5+)
 │   ├── workflow/            # typed model-role slots (Execution/Thinking/...)
 │   ├── budget/              # token heuristic + API-anchored calibrator
 │   ├── cost/                # immutable cost tracker
@@ -83,8 +86,9 @@ opendev-go/
 └── scripts/smoke.sh         # end-to-end smoke test against a real provider
 ```
 
-The `internal/` boundary enforces encapsulation — only `cmd/opendev`
-and tests can import these packages.
+The `internal/` boundary enforces encapsulation — only `cmd/opendev`,
+`cmd/opendev-tui`, and tests inside the module can import these
+packages.
 
 ## Dependencies
 
