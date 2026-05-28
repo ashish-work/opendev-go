@@ -62,10 +62,12 @@ type model struct {
 	width  int
 	height int
 
-	// history is the list of submitted lines, rendered into the
-	// viewport. One entry per submit. Plain strings only — typed
-	// roles arrive in a later commit.
-	history []string
+	// history is the list of messages rendered into the viewport,
+	// one viewMessage per role-tagged turn. Until the agent is wired
+	// in the next commit, each submit appends a real user message
+	// plus two placeholder messages (tool and assistant) so all
+	// three role styles are visible.
+	history []viewMessage
 
 	// quitting flips true when a global-quit key arrives; View
 	// returns "" to let the alt screen clean up.
@@ -132,15 +134,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "ctrl+d":
-			// Submit: pull the textarea's content, push it into history,
-			// clear the textarea, refresh and bottom-scroll the viewport.
+			// Submit: pull the textarea's content, push the user message
+			// into history along with placeholder tool + assistant
+			// messages so the three role styles are visible from this
+			// commit. The placeholders are stand-ins for what the real
+			// agent loop produces; the next commit replaces them with
+			// genuine turn output. Clear the textarea, refresh and
+			// bottom-scroll the viewport.
 			input := strings.TrimSpace(m.textarea.Value())
 			if input == "" {
 				// Nothing to submit. Empty Ctrl-D is a no-op rather
 				// than an error — keeps the UX forgiving.
 				return m, nil
 			}
-			m.history = append(m.history, "> "+input)
+			m.history = append(m.history,
+				viewMessage{role: roleUser, content: input},
+				viewMessage{
+					role:     roleTool,
+					toolName: "echo",
+					content:  "(placeholder tool output — the real agent wires up in the next commit)",
+				},
+				viewMessage{
+					role:    roleAssistant,
+					content: "(placeholder assistant reply — the real agent wires up in the next commit)",
+				},
+			)
 			m.textarea.Reset()
 			m.viewport.SetContent(m.renderHistory())
 			m.viewport.GotoBottom()
@@ -158,16 +176,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(taCmd, vpCmd)
 }
 
-// renderHistory joins history entries with blank lines between them.
-// This is the placeholder format — a later commit will introduce
-// role-aware rendering with distinct styles per message type.
+// renderHistory walks history and produces the viewport content. Each
+// entry renders independently via viewMessage.render, then they're
+// joined with a blank line between blocks for visual breathing room.
+// Empty history shows a help hint dimmed to read as meta.
 func (m model) renderHistory() string {
 	if len(m.history) == 0 {
 		return helpStyle.Render(
 			"(no messages yet — type below and press Ctrl-D to submit)",
 		)
 	}
-	return strings.Join(m.history, "\n\n")
+	rendered := make([]string, len(m.history))
+	for i, msg := range m.history {
+		rendered[i] = msg.render(m.viewport.Width)
+	}
+	return strings.Join(rendered, "\n\n")
 }
 
 // View renders the current model to a string. lipgloss.JoinVertical

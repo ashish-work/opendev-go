@@ -84,15 +84,35 @@ func TestUpdate_CtrlDSubmitsAndClears(t *testing.T) {
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
 	got := next.(model)
 
-	if len(got.history) != 1 {
-		t.Fatalf("history len = %d, want 1", len(got.history))
+	// One submit produces THREE history entries today: the real user
+	// message plus a tool placeholder and an assistant placeholder
+	// (so all three role styles are visible before #43 wires the
+	// real agent). #43 replaces the placeholders with actual turns.
+	if len(got.history) != 3 {
+		t.Fatalf("history len = %d, want 3 (user + tool placeholder + assistant placeholder)", len(got.history))
 	}
-	if !strings.Contains(got.history[0], "hello world") {
-		t.Errorf("history[0] = %q, want it to contain 'hello world'", got.history[0])
+
+	user := got.history[0]
+	if user.role != roleUser {
+		t.Errorf("history[0].role = %d, want roleUser", user.role)
 	}
-	if !strings.HasPrefix(got.history[0], "> ") {
-		t.Errorf("submitted entry should have '> ' prefix, got %q", got.history[0])
+	if user.content != "hello world" {
+		t.Errorf("history[0].content = %q, want 'hello world'", user.content)
 	}
+
+	tool := got.history[1]
+	if tool.role != roleTool {
+		t.Errorf("history[1].role = %d, want roleTool", tool.role)
+	}
+	if tool.toolName == "" {
+		t.Errorf("tool placeholder should set toolName")
+	}
+
+	asst := got.history[2]
+	if asst.role != roleAssistant {
+		t.Errorf("history[2].role = %d, want roleAssistant", asst.role)
+	}
+
 	if got.textarea.Value() != "" {
 		t.Errorf("textarea should be empty after submit, got %q", got.textarea.Value())
 	}
@@ -128,12 +148,18 @@ func TestUpdate_MultipleSubmitsAccumulate(t *testing.T) {
 		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
 		m = next.(model)
 	}
-	if len(m.history) != 3 {
-		t.Fatalf("history len = %d, want 3", len(m.history))
+	// 3 submits × 3 entries each (user + tool + assistant) = 9.
+	if len(m.history) != 9 {
+		t.Fatalf("history len = %d, want 9 (3 submits × 3 entries)", len(m.history))
 	}
-	for i, want := range []string{"first", "second", "third"} {
-		if !strings.Contains(m.history[i], want) {
-			t.Errorf("history[%d] = %q, want it to contain %q", i, m.history[i], want)
+	// Check the user entries (every third starting at index 0).
+	for batch, want := range []string{"first", "second", "third"} {
+		got := m.history[batch*3]
+		if got.role != roleUser {
+			t.Errorf("history[%d].role = %d, want roleUser", batch*3, got.role)
+		}
+		if got.content != want {
+			t.Errorf("history[%d].content = %q, want %q", batch*3, got.content, want)
 		}
 	}
 }
@@ -154,7 +180,14 @@ func TestView_RendersHistory(t *testing.T) {
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
 	got := next.(model).View()
 	if !strings.Contains(got, "test message") {
-		t.Errorf("View() should render history; got:\n%s", got)
+		t.Errorf("View() should render user content: %q", got)
+	}
+	// All three role headers should appear because every submit
+	// produces the user + tool placeholder + assistant placeholder.
+	for _, want := range []string{"you", "tool:", "assistant"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("View() should contain role header %q; got:\n%s", want, got)
+		}
 	}
 }
 
