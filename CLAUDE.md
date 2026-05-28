@@ -67,7 +67,8 @@ opendev-go/
 │                            #   that delegates to internal/tui
 ├── internal/
 │   ├── provider/            # Provider interface + normalized types
-│   │   └── openai/          # OpenAI-compatible Chat Completions adapter
+│   │   ├── openai/          # OpenAI-compatible Chat Completions adapter
+│   │   └── anthropic/       # Anthropic Messages API adapter
 │   ├── tools/               # Tool interface + registry
 │   │   ├── readfile/        # read_file
 │   │   ├── bash/            # foreground shell command runner
