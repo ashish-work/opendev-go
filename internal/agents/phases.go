@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/ashish-work/opendev-go/internal/agents/doomloop"
 	"github.com/ashish-work/opendev-go/internal/provider"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
@@ -150,6 +151,97 @@ func (l *ReactLoop) llmCallPhase(ctx context.Context, pc *PhaseContext) LoopActi
 
 	// Stash the response for process_response to consume.
 	pc.LastResponse = resp
+
+	return NewLoopActionContinue(pc.Tracker)
+}
+
+// processResponsePhase makes the complete-vs-tool-call decision for
+// one iteration. It reads pc.LastResponse and chooses one of three
+// branches:
+//
+//  1. No tool calls — the model produced a final answer. Append the
+//     assistant text to history (if any) and return Success.
+//
+//  2. Tool calls present, but the doom-loop detector says ForceStop
+//     — the model is stuck repeating itself. Append a SystemMessage
+//     with the warning and return ErrDoomLoop. CRITICAL: do NOT
+//     append the assistant message in this branch. Its tool_calls
+//     would orphan the corresponding tool-response slots and the
+//     next request would fail OpenAI's "assistant(tool_calls) must
+//     be immediately followed by tool messages" contract.
+//
+//  3. Tool calls present, detector says Continue / Redirect /
+//     Notify — append the assistant message (text + tool_calls) and
+//     hand off to the next phase, which will dispatch the tools.
+//     The doom-loop verdict is stashed on PhaseContext so that next
+//     phase can inject the warning + recovery hint AFTER tool
+//     dispatch finishes (Redirect / Notify only).
+//
+// detector.Check is called exactly once per iteration. The detector
+// mutates its sliding window on every call; double-Check'ing would
+// double-fingerprint and break the 3-stage escalation. We stash the
+// verdict on pc instead of recomputing.
+func (l *ReactLoop) processResponsePhase(_ context.Context, pc *PhaseContext) LoopAction {
+	resp := pc.LastResponse
+
+	// Branch 1: no tool calls. Final answer.
+	if len(resp.ToolCalls) == 0 {
+		if resp.Content != "" {
+			pc.AppendMessage(provider.Message{
+				Role: "assistant",
+				Content: []provider.ContentBlock{
+					{Kind: provider.ContentText, Text: resp.Content},
+				},
+			})
+		}
+		return NewLoopActionReturn(
+			Result{
+				Content:  resp.Content,
+				Success:  true,
+				Messages: *pc.History,
+				Budget:   pc.Snapshot(),
+			},
+			nil,
+			pc.Tracker,
+		)
+	}
+
+	// detector.Check once per iteration; verdict relayed via pc so
+	// execute_sequential can act on Redirect / Notify after tool
+	// dispatch finishes.
+	action, warning, recovery := pc.Detector.Check(resp.ToolCalls)
+	pc.DoomLoopAction = action
+	pc.DoomLoopWarning = warning
+	pc.DoomLoopRecovery = recovery
+
+	// Branch 2: doom-loop ForceStop. We refuse to dispatch and we
+	// don't record an assistant message whose tool_calls will never
+	// get tool responses — only a system note explaining the halt.
+	if action == doomloop.ForceStop {
+		pc.AppendMessage(SystemMessage(warning))
+		return NewLoopActionReturn(
+			Result{
+				Messages: *pc.History,
+				Budget:   pc.Snapshot(),
+			},
+			fmt.Errorf("%w: %s", ErrDoomLoop, warning),
+			pc.Tracker,
+		)
+	}
+
+	// Branch 3: dispatch path. Commit the assistant message; the
+	// next phase will dispatch its tools and append their results
+	// immediately, satisfying the tool_call → tool_response pairing.
+	assistant := provider.Message{
+		Role:      "assistant",
+		ToolCalls: resp.ToolCalls,
+	}
+	if resp.Content != "" {
+		assistant.Content = []provider.ContentBlock{
+			{Kind: provider.ContentText, Text: resp.Content},
+		}
+	}
+	pc.AppendMessage(assistant)
 
 	return NewLoopActionContinue(pc.Tracker)
 }

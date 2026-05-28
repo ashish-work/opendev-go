@@ -166,54 +166,18 @@ func (l *ReactLoop) RunWithStream(
 		cal = pc.Calibrator
 		resp := pc.LastResponse
 
-		// No tool calls = final answer. Append the assistant text and
-		// exit. We do this BEFORE the tool-call path so we can hold
-		// off on committing the assistant message until we've decided
-		// whether we will dispatch its tool_calls — appending an
-		// assistant message with tool_calls that don't get answered
-		// breaks OpenAI's "assistant(tool_calls) must be immediately
-		// followed by tool messages" contract.
-		if len(resp.ToolCalls) == 0 {
-			if resp.Content != "" {
-				history = append(history, provider.Message{
-					Role: "assistant",
-					Content: []provider.ContentBlock{
-						{Kind: provider.ContentText, Text: resp.Content},
-					},
-				})
-			}
-			return Result{
-				Content:  resp.Content,
-				Success:  true,
-				Messages: history,
-				Budget:   snapshot(),
-			}, tracker, nil
+		// process_response phase: makes the no-tool-call vs
+		// tool-call decision, runs the doom-loop ForceStop check,
+		// commits the assistant message to history on the dispatch
+		// path. Stashes the doom-loop verdict on pc so the
+		// still-inline Redirect / Notify path below can read it
+		// without re-calling the detector.
+		if action := l.processResponsePhase(ctx, pc); action.Kind == LoopActionReturn {
+			return action.Result, action.Tracker, action.Err
 		}
-
-		// Doom-loop check happens BEFORE we commit the assistant
-		// message to history. ForceStop discards the model's
-		// tool_calls (we refuse to dispatch and we don't record an
-		// assistant message whose tool_calls never get tool
-		// responses) — only a system note explaining the halt.
-		action, warning, recovery := detector.Check(resp.ToolCalls)
-		if action == doomloop.ForceStop {
-			history = append(history, SystemMessage(warning))
-			return Result{Messages: history, Budget: snapshot()}, tracker,
-				fmt.Errorf("%w: %s", ErrDoomLoop, warning)
-		}
-
-		// Commit the assistant message; we will dispatch its tools
-		// and append their results immediately below.
-		assistant := provider.Message{
-			Role:      "assistant",
-			ToolCalls: resp.ToolCalls,
-		}
-		if resp.Content != "" {
-			assistant.Content = []provider.ContentBlock{
-				{Kind: provider.ContentText, Text: resp.Content},
-			}
-		}
-		history = append(history, assistant)
+		action := pc.DoomLoopAction
+		warning := pc.DoomLoopWarning
+		recovery := pc.DoomLoopRecovery
 
 		// Dispatch each tool call in order. Tool-domain failures
 		// (Success: false ToolResult) flow into history as observations

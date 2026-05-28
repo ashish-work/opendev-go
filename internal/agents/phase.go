@@ -96,6 +96,25 @@ type PhaseContext struct {
 	// phase return to carry payload data. Per-iteration data
 	// belongs on the per-iteration state bundle.
 	LastResponse provider.Response
+
+	// DoomLoopAction is the verdict from this iteration's
+	// detector.Check call (Continue / Redirect / Notify /
+	// ForceStop). Set by processResponsePhase; consumed by
+	// execute_sequential on the Redirect / Notify paths after tool
+	// dispatch finishes. The detector mutates its sliding window on
+	// every Check call, so Check is invoked exactly once per
+	// iteration and the verdict is relayed here rather than
+	// recomputed.
+	DoomLoopAction doomloop.Action
+
+	// DoomLoopWarning is the warning string the detector produced
+	// alongside the action. Same lifecycle as DoomLoopAction.
+	DoomLoopWarning string
+
+	// DoomLoopRecovery is the recovery hint the detector produced
+	// for the Redirect / Notify paths (empty for Continue and
+	// ForceStop). Same lifecycle as DoomLoopAction.
+	DoomLoopRecovery string
 }
 
 // NewPhaseContext constructs a PhaseContext. Called exactly once per

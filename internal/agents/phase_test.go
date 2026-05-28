@@ -10,6 +10,24 @@ import (
 	"github.com/ashish-work/opendev-go/internal/tools"
 )
 
+func TestPhaseContext_DoomLoopFieldsStartZero(t *testing.T) {
+	// The verdict fields should be zero on construction —
+	// processResponsePhase populates them after running
+	// detector.Check, and None (the iota zero value of
+	// doomloop.Action) is the safe default if execute_sequential
+	// reads them before processResponsePhase runs.
+	pc, _ := newTestContext(t)
+	if pc.DoomLoopAction != doomloop.None {
+		t.Errorf("DoomLoopAction = %v, want None (zero value)", pc.DoomLoopAction)
+	}
+	if pc.DoomLoopWarning != "" {
+		t.Errorf("DoomLoopWarning = %q, want empty", pc.DoomLoopWarning)
+	}
+	if pc.DoomLoopRecovery != "" {
+		t.Errorf("DoomLoopRecovery = %q, want empty", pc.DoomLoopRecovery)
+	}
+}
+
 // newTestContext constructs a PhaseContext over a fresh history slice
 // and returns both the context and the history pointer so individual
 // tests can inspect the underlying slice without going through the

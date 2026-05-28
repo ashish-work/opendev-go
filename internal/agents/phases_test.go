@@ -2,6 +2,7 @@ package agents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -399,6 +400,207 @@ func TestLLMCallPhase_TrackerSurfacedEvenOnError(t *testing.T) {
 	// reflected on the action (or unchanged in the error path).
 	if action.Tracker.CallCount != 5 {
 		t.Errorf("Tracker.CallCount = %d, want 5 (preserved on error)",
+			action.Tracker.CallCount)
+	}
+}
+
+// newProcessTestRig builds a *ReactLoop and *PhaseContext primed for
+// processResponsePhase tests. resp is stashed on pc.LastResponse as
+// processResponsePhase will read it.
+func newProcessTestRig(t *testing.T, resp provider.Response) (*ReactLoop, *PhaseContext) {
+	t.Helper()
+	loop := &ReactLoop{
+		Config: Config{MaxIterations: 25, SystemPrompt: "system prompt"},
+	}
+	history := []provider.Message{
+		SystemMessage("system prompt"),
+		UserMessage("hello"),
+	}
+	pc := NewPhaseContext(
+		&history,
+		cost.Tracker{CallCount: 3},
+		budget.New(128_000),
+		doomloop.New(),
+		tools.ToolContext{},
+		nil,
+		"system prompt",
+	)
+	pc.Iter = 2
+	pc.LastResponse = resp
+	return loop, pc
+}
+
+func TestProcessResponsePhase_NoToolCallsReturnsSuccess(t *testing.T) {
+	loop, pc := newProcessTestRig(t, provider.Response{Content: "all done"})
+
+	action := loop.processResponsePhase(context.Background(), pc)
+	if action.Kind != LoopActionReturn {
+		t.Fatalf("Kind = %s, want return", action.Kind)
+	}
+	if action.Err != nil {
+		t.Errorf("Err = %v, want nil for success exit", action.Err)
+	}
+	if !action.Result.Success {
+		t.Errorf("Result.Success = false, want true")
+	}
+	if action.Result.Content != "all done" {
+		t.Errorf("Result.Content = %q, want %q", action.Result.Content, "all done")
+	}
+	// History should have grown: original 2 + appended assistant = 3.
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3 (assistant appended)", got)
+	}
+	last := (*pc.History)[2]
+	if last.Role != "assistant" || last.Content[0].Text != "all done" {
+		t.Errorf("appended message = %+v, want assistant 'all done'", last)
+	}
+}
+
+func TestProcessResponsePhase_NoToolCallsEmptyContentReturnsSuccessNoAppend(t *testing.T) {
+	// Empty content + no tool calls is an edge case the original code
+	// handles by NOT appending a phantom empty assistant message.
+	loop, pc := newProcessTestRig(t, provider.Response{Content: ""})
+
+	action := loop.processResponsePhase(context.Background(), pc)
+	if action.Kind != LoopActionReturn {
+		t.Fatalf("Kind = %s, want return", action.Kind)
+	}
+	if !action.Result.Success {
+		t.Errorf("Result.Success = false, want true")
+	}
+	if got := len(*pc.History); got != 2 {
+		t.Errorf("history len = %d, want 2 (no phantom assistant on empty content)", got)
+	}
+}
+
+func TestProcessResponsePhase_ToolCallsContinue(t *testing.T) {
+	resp := provider.Response{
+		Content: "I'll check the file.",
+		ToolCalls: []provider.ToolCall{{
+			ID: "c1", Name: "read_file",
+			Arguments: json.RawMessage(`{"path":"x.go"}`),
+		}},
+	}
+	loop, pc := newProcessTestRig(t, resp)
+
+	action := loop.processResponsePhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue (dispatch path)", action.Kind)
+	}
+
+	// History: original 2 + assistant with text + tool_calls = 3.
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3", got)
+	}
+	last := (*pc.History)[2]
+	if last.Role != "assistant" {
+		t.Errorf("appended role = %q, want assistant", last.Role)
+	}
+	if len(last.ToolCalls) != 1 || last.ToolCalls[0].ID != "c1" {
+		t.Errorf("appended ToolCalls = %+v, want one with ID=c1", last.ToolCalls)
+	}
+	if len(last.Content) != 1 || last.Content[0].Text != "I'll check the file." {
+		t.Errorf("appended Content = %+v, want text block", last.Content)
+	}
+}
+
+func TestProcessResponsePhase_ToolCallsNoTextStillCommitsAssistant(t *testing.T) {
+	// Model emits tool_calls with no text — the assistant message
+	// must still be appended (with empty Content) so its tool_calls
+	// pair with the upcoming tool_response messages.
+	resp := provider.Response{
+		ToolCalls: []provider.ToolCall{{ID: "c1", Name: "foo"}},
+	}
+	loop, pc := newProcessTestRig(t, resp)
+
+	action := loop.processResponsePhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3 (assistant appended even without text)", got)
+	}
+	last := (*pc.History)[2]
+	if last.Role != "assistant" {
+		t.Errorf("appended role = %q, want assistant", last.Role)
+	}
+	if len(last.Content) != 0 {
+		t.Errorf("Content should be empty when resp.Content is empty; got %+v", last.Content)
+	}
+}
+
+func TestProcessResponsePhase_ForceStopReturnsErrDoomLoop(t *testing.T) {
+	// Drive the detector into ForceStop by repeating the same
+	// fingerprint enough times. The detector escalates Redirect →
+	// Notify → ForceStop, so three Checks of the same call set
+	// reach ForceStop.
+	resp := provider.Response{
+		ToolCalls: []provider.ToolCall{{
+			ID: "c1", Name: "foo",
+			Arguments: json.RawMessage(`{}`),
+		}},
+	}
+	loop, pc := newProcessTestRig(t, resp)
+	// Pre-poison the detector so this iteration's Check is the one
+	// that escalates to ForceStop. The detector escalates per
+	// detected cycle: it takes 3 repeats to trigger the first
+	// Redirect, a 4th to trigger Notify, and a 5th to trigger
+	// ForceStop (nudgeCount = 3). So 4 priming Checks plus the
+	// phase's own Check makes the phase's call the 5th.
+	for i := 0; i < 4; i++ {
+		pc.Detector.Check(resp.ToolCalls)
+	}
+
+	action := loop.processResponsePhase(context.Background(), pc)
+	if action.Kind != LoopActionReturn {
+		t.Fatalf("Kind = %s, want return (ForceStop)", action.Kind)
+	}
+	if !errors.Is(action.Err, ErrDoomLoop) {
+		t.Errorf("Err = %v, want chain containing ErrDoomLoop", action.Err)
+	}
+	// CRITICAL: history should have the SystemMessage warning, NOT
+	// the assistant message (whose tool_calls would orphan tool
+	// responses).
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3 (system warning appended)", got)
+	}
+	last := (*pc.History)[2]
+	if last.Role != "system" {
+		t.Errorf("appended role = %q, want system (warning)", last.Role)
+	}
+	// No assistant message should appear after the user message.
+	for i, m := range *pc.History {
+		if m.Role == "assistant" {
+			t.Errorf("unexpected assistant message at index %d on ForceStop path: %+v", i, m)
+		}
+	}
+}
+
+func TestProcessResponsePhase_StashesVerdictOnContinuePath(t *testing.T) {
+	// On the dispatch path (not ForceStop), the verdict should be
+	// stashed on pc so the still-inline Redirect / Notify post-
+	// dispatch logic can consume it.
+	resp := provider.Response{
+		ToolCalls: []provider.ToolCall{{ID: "c1", Name: "foo"}},
+	}
+	loop, pc := newProcessTestRig(t, resp)
+
+	_ = loop.processResponsePhase(context.Background(), pc)
+	// First Check of a fresh detector produces None (no repeats
+	// yet). Verdict fields are still populated — the still-inline
+	// Redirect/Notify code below reads them.
+	if pc.DoomLoopAction != doomloop.None {
+		t.Errorf("DoomLoopAction = %v, want None (first check)", pc.DoomLoopAction)
+	}
+}
+
+func TestProcessResponsePhase_TrackerPassesThrough(t *testing.T) {
+	resp := provider.Response{Content: "done"}
+	loop, pc := newProcessTestRig(t, resp)
+
+	action := loop.processResponsePhase(context.Background(), pc)
+	if action.Tracker.CallCount != 3 {
+		t.Errorf("Tracker.CallCount = %d, want 3 (preserved through process_response)",
 			action.Tracker.CallCount)
 	}
 }
