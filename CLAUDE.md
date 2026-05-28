@@ -62,7 +62,8 @@ reading and writing code here.
 ```
 opendev-go/
 ├── go.mod
-├── cmd/opendev/             # CLI entry point: REPL
+├── cmd/opendev/             # CLI entry point: REPL (v1; minimal surface)
+├── cmd/opendev-tui/         # CLI entry point: Bubble Tea TUI (v2 Phase 1.5+)
 ├── internal/
 │   ├── provider/            # Provider interface + normalized types
 │   │   └── openai/          # OpenAI-compatible Chat Completions adapter
@@ -102,6 +103,27 @@ Third-party additions (each recorded with a justification):
   unclosed tags, nested elements, and entity escapes that regex
   patterns handle poorly. Pinned to v0.43.0 to keep the module's
   Go directive at 1.24.1 (newer x/net releases require Go 1.25+).
+
+- `github.com/charmbracelet/bubbletea` — Elm-style TUI framework
+  (Model/Update/View) powering `cmd/opendev-tui`. MIT-licensed,
+  mature, used by the GitHub CLI, glow, and many others. The
+  canonical Go answer for terminal UI; the alternative (raw
+  tcell/termbox) would mean reinventing message dispatch, focus
+  management, and alt-screen handling ourselves.
+
+- `github.com/charmbracelet/bubbles` — premade Bubble Tea widgets
+  (`textarea`, `viewport`, `spinner`, `list`). Used as building
+  blocks for `cmd/opendev-tui`. Same author/ecosystem; no
+  transitive bloat beyond what bubbletea pulls in.
+
+- `github.com/charmbracelet/lipgloss` — declarative terminal
+  styling (borders, colors, padding, alignment, layout). Used
+  by `cmd/opendev-tui` for every rendered panel.
+
+  All three Charm libs together pull in ~10 transitive deps that
+  are standard for any Bubble Tea program (ANSI rendering,
+  Unicode width, termenv color detection). Documented here so the
+  set doesn't drift unnoticed.
 
 Adding another third-party dep requires a recorded decision in this
 file first.
