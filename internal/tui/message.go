@@ -2,6 +2,8 @@ package tui
 
 import (
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/ashish-work/opendev-go/internal/provider"
 )
 
 // messageRole identifies the speaker of a viewMessage. Three roles
@@ -101,6 +103,75 @@ func (m viewMessage) render(width int) string {
 	headerLine := headerStyle.Render("▎ " + header)
 	body := bodyStyle.Width(width).Render(m.content)
 	return headerLine + "\n" + body
+}
+
+// translateMessages converts a slice of provider.Message (the wire
+// format the agent loop produces) into the TUI-local viewMessage
+// shape used for rendering. The translation is intentionally lossy:
+//
+//   - "system" role is skipped entirely. The system prompt is set-
+//     once configuration, not a transcript turn.
+//   - "user" messages become one viewMessage per text content block.
+//   - "assistant" messages become one viewMessage per text content
+//     block. The assistant's tool_calls themselves do NOT render —
+//     they're scaffolding for the next iteration; the user sees the
+//     tool RESULTS (the "tool"-role messages that follow) instead.
+//     Rendering the tool_call as a separate "the model decided to
+//     call X" entry would double-count it visually.
+//   - "tool" messages become a viewMessage with role=roleTool, with
+//     toolName populated from the message's Name field and content
+//     from its first text block.
+//
+// Unknown roles are skipped silently. Empty-content blocks are also
+// skipped — a literal empty viewMessage would render as a styled
+// header with nothing below it, which looks broken.
+func translateMessages(msgs []provider.Message) []viewMessage {
+	out := make([]viewMessage, 0, len(msgs))
+	for _, m := range msgs {
+		switch m.Role {
+		case "system":
+			// not part of the visible transcript
+
+		case "user":
+			for _, c := range m.Content {
+				if c.Kind == provider.ContentText && c.Text != "" {
+					out = append(out, viewMessage{role: roleUser, content: c.Text})
+				}
+			}
+
+		case "assistant":
+			for _, c := range m.Content {
+				if c.Kind == provider.ContentText && c.Text != "" {
+					out = append(out, viewMessage{role: roleAssistant, content: c.Text})
+				}
+			}
+
+		case "tool":
+			text := firstTextBlock(m.Content)
+			if text == "" {
+				continue
+			}
+			out = append(out, viewMessage{
+				role:     roleTool,
+				toolName: m.Name,
+				content:  text,
+			})
+		}
+	}
+	return out
+}
+
+// firstTextBlock returns the first text content from a message, or "".
+// Tool messages typically carry a single text block (the tool's
+// stdout); this helper just picks it out without assuming index 0
+// is text.
+func firstTextBlock(blocks []provider.ContentBlock) string {
+	for _, b := range blocks {
+		if b.Kind == provider.ContentText {
+			return b.Text
+		}
+	}
+	return ""
 }
 
 // Pre-built styles. Declared as package vars so each render call

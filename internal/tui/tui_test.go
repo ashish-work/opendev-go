@@ -11,9 +11,12 @@ import (
 // hostile to unit tests. We exercise the model's Init/Update/View
 // contract directly — pure functions, easy to test — and verify the
 // interactive surface manually.
+//
+// Tests that need a real *agents.ReactLoop construct one with a stub
+// Provider; see newTestModel below.
 
 func TestInitialModel_TextareaFocused(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil)
 	if !m.textarea.Focused() {
 		t.Errorf("textarea should be focused on startup")
 	}
@@ -26,17 +29,20 @@ func TestInitialModel_TextareaFocused(t *testing.T) {
 	if m.quitting {
 		t.Errorf("model should not start in quitting state")
 	}
+	if m.thinking {
+		t.Errorf("model should not start in thinking state")
+	}
 }
 
 func TestInit_ReturnsBlinkCmd(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil)
 	if cmd := m.Init(); cmd == nil {
 		t.Errorf("Init() should return textarea.Blink to start cursor blinking, got nil")
 	}
 }
 
 func TestUpdate_WindowSizeMsgResizesWidgets(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil)
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	got := next.(model)
 	if got.width != 120 || got.height != 40 {
@@ -54,7 +60,7 @@ func TestUpdate_WindowSizeMsgResizesWidgets(t *testing.T) {
 func TestUpdate_TinyTerminalClampsViewport(t *testing.T) {
 	// If the terminal is so small that input + divider > height, the
 	// viewport height should clamp to 0 instead of going negative.
-	m := initialModel()
+	m := initialModel(nil)
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 3})
 	got := next.(model)
 	if got.viewport.Height != 0 {
@@ -62,64 +68,97 @@ func TestUpdate_TinyTerminalClampsViewport(t *testing.T) {
 	}
 }
 
-func TestUpdate_CtrlCQuits(t *testing.T) {
-	m := initialModel()
+func TestUpdate_CtrlCQuitsWhenIdle(t *testing.T) {
+	m := initialModel(nil)
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	if !next.(model).quitting {
-		t.Errorf("Ctrl-C should set quitting=true")
+		t.Errorf("Ctrl-C should set quitting=true when idle")
 	}
 	if cmd == nil {
-		t.Fatal("Ctrl-C should return tea.Quit command")
+		t.Fatal("Ctrl-C while idle should return tea.Quit command")
 	}
 	if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Errorf("Ctrl-C cmd produced %T, want tea.QuitMsg", cmd())
 	}
 }
 
+func TestUpdate_CtrlCCancelsTurnWhenThinking(t *testing.T) {
+	// Build a model that's in the middle of a turn: thinking=true,
+	// turnCancel set. Ctrl-C should cancel the turn (call the cancel
+	// func) and NOT quit the program.
+	cancelled := false
+	m := initialModel(nil)
+	m.thinking = true
+	m.turnCancel = func() { cancelled = true }
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	got := next.(model)
+	if !cancelled {
+		t.Errorf("Ctrl-C while thinking should invoke turnCancel")
+	}
+	if got.quitting {
+		t.Errorf("Ctrl-C while thinking should NOT set quitting")
+	}
+	if cmd != nil {
+		// We expect nil — the cancellation just signals the in-flight
+		// goroutine. The follow-up turnCompleteMsg arrives via the
+		// already-dispatched runTurnCmd, not via a new cmd here.
+		t.Errorf("Ctrl-C while thinking should return nil cmd, got %v", cmd)
+	}
+}
+
 func TestUpdate_CtrlDSubmitsAndClears(t *testing.T) {
-	m := initialModel()
+	loop := newTestLoop(t, stubProvider{})
+	m := initialModel(loop)
 	m, _ = applyWindowSize(m, 100, 30)
 	m = typeInto(m, "hello world")
 
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
 	got := next.(model)
 
-	// One submit produces THREE history entries today: the real user
-	// message plus a tool placeholder and an assistant placeholder
-	// (so all three role styles are visible before #43 wires the
-	// real agent). #43 replaces the placeholders with actual turns.
-	if len(got.history) != 3 {
-		t.Fatalf("history len = %d, want 3 (user + tool placeholder + assistant placeholder)", len(got.history))
+	// Submit should optimistically append the user message, enter
+	// thinking state, clear the textarea, and return a runTurnCmd
+	// for Bubble Tea to execute.
+	if !got.thinking {
+		t.Errorf("Ctrl-D should put model into thinking state")
 	}
-
-	user := got.history[0]
-	if user.role != roleUser {
-		t.Errorf("history[0].role = %d, want roleUser", user.role)
+	if got.turnCancel == nil {
+		t.Errorf("Ctrl-D should store a cancel func for the in-flight turn")
 	}
-	if user.content != "hello world" {
-		t.Errorf("history[0].content = %q, want 'hello world'", user.content)
+	if len(got.history) != 1 {
+		t.Fatalf("optimistic history len = %d, want 1 (just the user message)", len(got.history))
 	}
-
-	tool := got.history[1]
-	if tool.role != roleTool {
-		t.Errorf("history[1].role = %d, want roleTool", tool.role)
+	if got.history[0].role != roleUser || got.history[0].content != "hello world" {
+		t.Errorf("optimistic history[0] = %+v, want {user, 'hello world'}", got.history[0])
 	}
-	if tool.toolName == "" {
-		t.Errorf("tool placeholder should set toolName")
-	}
-
-	asst := got.history[2]
-	if asst.role != roleAssistant {
-		t.Errorf("history[2].role = %d, want roleAssistant", asst.role)
-	}
-
 	if got.textarea.Value() != "" {
 		t.Errorf("textarea should be empty after submit, got %q", got.textarea.Value())
+	}
+	if cmd == nil {
+		t.Errorf("Ctrl-D should return a runTurnCmd, got nil")
+	}
+}
+
+func TestUpdate_CtrlDIgnoredWhileThinking(t *testing.T) {
+	m := initialModel(nil)
+	m.thinking = true
+	m = typeInto(m, "second submit while first is running")
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	got := next.(model)
+	// History shouldn't have grown; cmd is nil; thinking stays true.
+	if len(got.history) != 0 {
+		t.Errorf("history should not grow during in-flight turn, got %d", len(got.history))
+	}
+	if cmd != nil {
+		t.Errorf("Ctrl-D while thinking should be a no-op, got cmd %v", cmd)
+	}
+	if !got.thinking {
+		t.Errorf("Ctrl-D while thinking should leave thinking=true")
 	}
 }
 
 func TestUpdate_CtrlDEmptyIsNoOp(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	// No input typed. Submit anyway.
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
@@ -127,10 +166,13 @@ func TestUpdate_CtrlDEmptyIsNoOp(t *testing.T) {
 	if len(got.history) != 0 {
 		t.Errorf("empty Ctrl-D should not append to history, got %d entries", len(got.history))
 	}
+	if got.thinking {
+		t.Errorf("empty Ctrl-D should not enter thinking state")
+	}
 }
 
 func TestUpdate_CtrlDWhitespaceIsNoOp(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m = typeInto(m, "   \n\t  ")
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
@@ -138,34 +180,13 @@ func TestUpdate_CtrlDWhitespaceIsNoOp(t *testing.T) {
 	if len(got.history) != 0 {
 		t.Errorf("whitespace-only submit should be a no-op, got %d history entries", len(got.history))
 	}
-}
-
-func TestUpdate_MultipleSubmitsAccumulate(t *testing.T) {
-	m := initialModel()
-	m, _ = applyWindowSize(m, 100, 30)
-	for _, s := range []string{"first", "second", "third"} {
-		m = typeInto(m, s)
-		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-		m = next.(model)
-	}
-	// 3 submits × 3 entries each (user + tool + assistant) = 9.
-	if len(m.history) != 9 {
-		t.Fatalf("history len = %d, want 9 (3 submits × 3 entries)", len(m.history))
-	}
-	// Check the user entries (every third starting at index 0).
-	for batch, want := range []string{"first", "second", "third"} {
-		got := m.history[batch*3]
-		if got.role != roleUser {
-			t.Errorf("history[%d].role = %d, want roleUser", batch*3, got.role)
-		}
-		if got.content != want {
-			t.Errorf("history[%d].content = %q, want %q", batch*3, got.content, want)
-		}
+	if got.thinking {
+		t.Errorf("whitespace-only Ctrl-D should not enter thinking state")
 	}
 }
 
 func TestView_EmptyShowsHelpHint(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	out := m.View()
 	if !strings.Contains(out, "no messages yet") {
@@ -173,26 +194,8 @@ func TestView_EmptyShowsHelpHint(t *testing.T) {
 	}
 }
 
-func TestView_RendersHistory(t *testing.T) {
-	m := initialModel()
-	m, _ = applyWindowSize(m, 100, 30)
-	m = typeInto(m, "test message")
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
-	got := next.(model).View()
-	if !strings.Contains(got, "test message") {
-		t.Errorf("View() should render user content: %q", got)
-	}
-	// All three role headers should appear because every submit
-	// produces the user + tool placeholder + assistant placeholder.
-	for _, want := range []string{"you", "tool:", "assistant"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("View() should contain role header %q; got:\n%s", want, got)
-		}
-	}
-}
-
 func TestView_PreWindowSizeFallback(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil)
 	// No WindowSizeMsg yet — width is 0.
 	out := m.View()
 	if !strings.Contains(out, "starting") {
@@ -201,11 +204,26 @@ func TestView_PreWindowSizeFallback(t *testing.T) {
 }
 
 func TestView_EmptyWhenQuitting(t *testing.T) {
-	m := initialModel()
+	m := initialModel(nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.quitting = true
 	if out := m.View(); out != "" {
 		t.Errorf("View() should be empty when quitting, got %q", out)
+	}
+}
+
+func TestView_ThinkingIndicatorAppearsDuringTurn(t *testing.T) {
+	m := initialModel(nil)
+	m, _ = applyWindowSize(m, 100, 30)
+	m.thinking = true
+	// Refresh the viewport's cached content. In production code, the
+	// Ctrl-D handler does this implicitly via SetContent(...) right
+	// after flipping thinking=true; here we mimic that step because
+	// we set the bool directly.
+	m.viewport.SetContent(m.renderHistory())
+	out := m.View()
+	if !strings.Contains(out, "thinking") {
+		t.Errorf("View() should show 'thinking' indicator while in-flight, got:\n%s", out)
 	}
 }
 
