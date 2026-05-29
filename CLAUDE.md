@@ -162,6 +162,45 @@ Flags:
 - `-system` to override the built-in system prompt
 - `-base-url` to point at an OpenAI-compatible endpoint
 
+## Hooks
+
+User-configured shell commands fire at 10 points in the agent's
+lifecycle. The hook system reads `~/.opendev/settings.json` (user-
+wide) and `<workingDir>/.opendev/settings.json` (project-specific)
+and runs matching commands via `sh -c`, piping a JSON payload to
+stdin and reading a JSON decision back from stdout.
+
+The 10 events: `session_start`, `user_prompt_submit`, `pre_tool_use`,
+`post_tool_use`, `post_tool_use_failure`, `subagent_start`,
+`subagent_stop`, `stop`, `pre_compact`, `session_end`.
+
+Example: block bash and audit every turn.
+
+```json
+{
+  "hooks": {
+    "session_start": [
+      {"command": "echo '{\"additionalContext\":\"Be concise.\"}'"}
+    ],
+    "pre_tool_use": [
+      {
+        "matcher": "^bash$",
+        "command": "echo '{\"permissionDecision\":\"deny\",\"reason\":\"bash blocked\"}'"
+      }
+    ],
+    "stop": [
+      {"command": "echo turn done >> /tmp/opendev-audit.log"}
+    ]
+  }
+}
+```
+
+Hooks emit a `HookDecision` JSON object: `additionalContext` is
+appended/prepended (depending on event), `updatedInput` replaces the
+operation's input, `permissionDecision` (`allow`/`deny`/`ask`) gates
+when applicable, `reason` is shown to the user on deny. Per-hook
+timeout is 30 seconds by default; override with `timeout_ms`.
+
 ## Smoke test
 
 `scripts/smoke.sh` exercises the closed loop against a real provider.

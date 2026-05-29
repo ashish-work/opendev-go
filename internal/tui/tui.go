@@ -36,7 +36,9 @@ import (
 	"github.com/ashish-work/opendev-go/internal/agents"
 	"github.com/ashish-work/opendev-go/internal/budget"
 	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/session"
 )
 
 // Layout constants. Fixed values for now; later commits can make
@@ -136,6 +138,28 @@ type model struct {
 	// assistant entry rather than concatenating into the previous
 	// iteration's reply.
 	pendingAssistantIdx int
+
+	// hookManager is the optional lifecycle hook manager. nil is
+	// valid and means "no hooks fire" — the Ctrl-D handler skips
+	// the prompt-submit step and runs the turn directly. Set via
+	// Run.
+	hookManager *hooks.Manager
+
+	// session carries the per-run identity passed to lifecycle hook
+	// payloads (UserPromptSubmit, Stop). nil when hookManager is
+	// nil. Set via Run.
+	session *session.Session
+
+	// pendingTurnCtx is the context the in-flight turn will run
+	// against, captured when Ctrl-D fires and held until
+	// promptSubmitResultMsg dispatches the turn. nil while idle.
+	// Bubble Tea messages can't carry context.Context cleanly, so
+	// we stash it on the model rather than threading through Msg.
+	pendingTurnCtx context.Context
+
+	// pendingTurnInput is the user's prompt held between Ctrl-D
+	// and promptSubmitResultMsg. Empty while idle.
+	pendingTurnInput string
 }
 
 // initialModel constructs the starting state with both widgets ready,
@@ -143,7 +167,12 @@ type model struct {
 // bar. Dimensions are zero until the first tea.WindowSizeMsg arrives
 // — that happens immediately on program start, so the user never
 // sees a zero-sized panel.
-func initialModel(loop *agents.ReactLoop, modelName string) model {
+//
+// hookManager and sess are optional. When both are non-nil the
+// Ctrl-D handler fires UserPromptSubmit before running each turn
+// (deny short-circuits with an in-history notice); when either is
+// nil the handler runs the turn directly.
+func initialModel(loop *agents.ReactLoop, modelName string, hookManager *hooks.Manager, sess *session.Session) model {
 	ta := textarea.New()
 	ta.Placeholder = "Type — Ctrl-D submit · Ctrl-T toggle tool details · PgUp/PgDn scroll · Ctrl-C cancel/quit"
 	ta.CharLimit = 0 // unlimited; we cap effective size via the agent's token budget
@@ -158,6 +187,8 @@ func initialModel(loop *agents.ReactLoop, modelName string) model {
 		loop:                loop,
 		modelName:           modelName,
 		pendingAssistantIdx: -1,
+		hookManager:         hookManager,
+		session:             sess,
 	}
 }
 
@@ -272,25 +303,64 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.history = append(m.history, viewMessage{role: roleUser, content: input})
 			m.textarea.Reset()
 
-			// Build the cancellable context + per-turn stream channel,
-			// store the cancel func so Ctrl-C can call it, and dispatch
-			// the turn alongside the event-reader Cmd. Bubble Tea runs
-			// both Cmds concurrently and serializes their resulting
-			// Msgs back through Update.
+			// Build the cancellable context so Ctrl-C can interrupt
+			// either the prompt-submit hook or the turn itself.
 			ctx, cancel := context.WithCancel(context.Background())
 			m.turnCancel = cancel
 			m.thinking = true
-			m.streamCh = make(chan provider.StreamEvent, streamSinkBufferSize)
-			m.pendingAssistantIdx = -1
-
 			m.viewport.SetContent(m.renderHistory())
 			m.viewport.GotoBottom()
 
-			return m, tea.Batch(
-				runTurnCmd(ctx, m.loop, input, m.streamCh),
-				nextStreamEventCmd(m.streamCh),
-			)
+			// Fast path: no hook manager → start the turn directly,
+			// same Cmd shape as before #35.
+			if m.hookManager == nil || m.session == nil {
+				m.streamCh = make(chan provider.StreamEvent, streamSinkBufferSize)
+				m.pendingAssistantIdx = -1
+				return m, tea.Batch(
+					runTurnCmd(ctx, m.loop, input, m.streamCh),
+					nextStreamEventCmd(m.streamCh),
+				)
+			}
+
+			// Slow path: stash ctx + input on the model, fire the
+			// prompt-submit hook async, await promptSubmitResultMsg.
+			m.pendingTurnCtx = ctx
+			m.pendingTurnInput = input
+			return m, firePromptSubmitCmd(ctx, m.session, m.hookManager, input)
 		}
+
+	case promptSubmitResultMsg:
+		if msg.denied {
+			// Show the deny reason inline; user keeps interacting.
+			m.history = append(m.history, viewMessage{
+				role:    roleAssistant,
+				content: fmt.Sprintf("(denied by hook: %s)", msg.reason),
+			})
+			m.thinking = false
+			if m.turnCancel != nil {
+				m.turnCancel()
+				m.turnCancel = nil
+			}
+			m.pendingTurnCtx = nil
+			m.pendingTurnInput = ""
+			m.viewport.SetContent(m.renderHistory())
+			m.viewport.GotoBottom()
+			return m, nil
+		}
+		// Approved: start the turn with the (possibly rewritten) prompt.
+		m.streamCh = make(chan provider.StreamEvent, streamSinkBufferSize)
+		m.pendingAssistantIdx = -1
+		ctx := m.pendingTurnCtx
+		m.pendingTurnCtx = nil
+		m.pendingTurnInput = ""
+		return m, tea.Batch(
+			runTurnCmd(ctx, m.loop, msg.prompt, m.streamCh),
+			nextStreamEventCmd(m.streamCh),
+		)
+
+	case stopHookDoneMsg:
+		// Stop hook is fire-and-forget; no UI work needed.
+		return m, nil
 
 	case streamEventMsg:
 		// One streamed event lands. Update the live transcript and
@@ -383,6 +453,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.viewport.SetContent(m.renderHistory())
 		m.viewport.GotoBottom()
+
+		// Fire Stop hook (fire-and-forget; UI returns immediately).
+		// Skip the Cmd when hooks aren't wired so we don't spawn
+		// a goroutine to do nothing.
+		if m.hookManager != nil && m.session != nil {
+			var replyText, errStr string
+			if msg.err != nil {
+				errStr = msg.err.Error()
+			} else {
+				replyText = msg.result.Content
+			}
+			return m, fireStopCmd(context.Background(), m.session, m.hookManager, replyText, errStr)
+		}
 		return m, nil
 	}
 
@@ -581,10 +664,15 @@ func applyStreamEvent(m model, ev provider.StreamEvent) model {
 //
 // modelName is shown in the status bar. It's passed in (rather than
 // pulled from loop.Config.Workflow) so the binary stays the single
-// source of truth for its own configuration, and so the TUI doesn't
-// need a getter on the v1 ReactLoop type just for display purposes.
-func Run(loop *agents.ReactLoop, modelName string) error {
-	p := tea.NewProgram(initialModel(loop, modelName), tea.WithAltScreen())
+// source of truth for its own configuration.
+//
+// hookManager and sess are optional. Both nil means hooks don't
+// fire; when both are non-nil the TUI fires UserPromptSubmit before
+// each turn and Stop after each turn completes. SessionStart and
+// SessionEnd are fired by the binary itself (before/after Run)
+// since they bracket the whole TUI runtime.
+func Run(loop *agents.ReactLoop, modelName string, sess *session.Session, hookManager *hooks.Manager) error {
+	p := tea.NewProgram(initialModel(loop, modelName, hookManager, sess), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }

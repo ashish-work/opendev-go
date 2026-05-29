@@ -13,12 +13,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 
 	"github.com/ashish-work/opendev-go/internal/agents"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider/router"
+	"github.com/ashish-work/opendev-go/internal/session"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/tools/bash"
 	"github.com/ashish-work/opendev-go/internal/tools/editfile"
@@ -81,18 +84,61 @@ func main() {
 	mustRegister(registry, webfetch.New())
 	mustRegister(registry, websearch.New())
 
+	// Load hooks from settings.json (user + project). Missing files
+	// are not errors. Construct the manager only when at least one
+	// hook is registered so nil-Manager paths stay fast.
+	hookSettings, err := hooks.Load(workingDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: load hooks: %v\n", err)
+		os.Exit(1)
+	}
+	var hookManager *hooks.Manager
+	if len(hookSettings.Hooks) > 0 {
+		hookManager = hooks.NewManager(hookSettings, hooks.NewExecutor(workingDir))
+	}
+
+	// Construct session + fire SessionStart. Deny exits with the
+	// reason; allow's AdditionalContext appends to the system prompt.
+	sess := session.New(workingDir)
+	startResult, err := sess.FireStart(context.Background(), hookManager)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: SessionStart hook: %v\n", err)
+		os.Exit(1)
+	}
+	if startResult.Denied {
+		fmt.Fprintf(os.Stderr, "session blocked: %s\n", startResult.Reason)
+		os.Exit(1)
+	}
+	effectiveSystemPrompt := *systemPrompt
+	if startResult.AdditionalContext != "" {
+		if effectiveSystemPrompt != "" {
+			effectiveSystemPrompt += "\n\n" + startResult.AdditionalContext
+		} else {
+			effectiveSystemPrompt = startResult.AdditionalContext
+		}
+	}
+
 	loop := agents.NewReactLoop(caller, registry, agents.Config{
 		Workflow: workflow.Config{
 			Execution: workflow.SlotConfig{Model: *model},
 		},
 		MaxIterations:    *maxIter,
-		SystemPrompt:     *systemPrompt,
+		SystemPrompt:     effectiveSystemPrompt,
 		WorkingDir:       workingDir,
 		MaxContextTokens: *maxContext,
 	})
+	loop.Hooks = hookManager
 
-	if err := tui.Run(loop, *model); err != nil {
-		fmt.Fprintln(os.Stderr, "opendev-tui:", err)
+	runErr := tui.Run(loop, *model, sess, hookManager)
+
+	// SessionEnd hook (fire-and-forget) — runs even if the TUI
+	// reported an error so audit hooks still see end-of-session.
+	// Totals would come from the model's tracker but the TUI
+	// doesn't surface them through Run yet; pass zeros for now.
+	sess.FireEnd(context.Background(), hookManager, 0, 0)
+
+	if runErr != nil {
+		fmt.Fprintln(os.Stderr, "opendev-tui:", runErr)
 		os.Exit(1)
 	}
 }

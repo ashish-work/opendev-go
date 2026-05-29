@@ -21,7 +21,7 @@ import (
 // Provider; see newTestModel below.
 
 func TestInitialModel_TextareaFocused(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	if !m.textarea.Focused() {
 		t.Errorf("textarea should be focused on startup")
 	}
@@ -40,14 +40,14 @@ func TestInitialModel_TextareaFocused(t *testing.T) {
 }
 
 func TestInit_ReturnsBlinkCmd(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	if cmd := m.Init(); cmd == nil {
 		t.Errorf("Init() should return textarea.Blink to start cursor blinking, got nil")
 	}
 }
 
 func TestUpdate_WindowSizeMsgResizesWidgets(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	got := next.(model)
 	if got.width != 120 || got.height != 40 {
@@ -65,7 +65,7 @@ func TestUpdate_WindowSizeMsgResizesWidgets(t *testing.T) {
 func TestUpdate_TinyTerminalClampsViewport(t *testing.T) {
 	// If the terminal is so small that input + divider > height, the
 	// viewport height should clamp to 0 instead of going negative.
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 3})
 	got := next.(model)
 	if got.viewport.Height != 0 {
@@ -74,7 +74,7 @@ func TestUpdate_TinyTerminalClampsViewport(t *testing.T) {
 }
 
 func TestUpdate_CtrlCQuitsWhenIdle(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	if !next.(model).quitting {
 		t.Errorf("Ctrl-C should set quitting=true when idle")
@@ -92,7 +92,7 @@ func TestUpdate_CtrlCCancelsTurnWhenThinking(t *testing.T) {
 	// turnCancel set. Ctrl-C should cancel the turn (call the cancel
 	// func) and NOT quit the program.
 	cancelled := false
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m.thinking = true
 	m.turnCancel = func() { cancelled = true }
 
@@ -114,7 +114,7 @@ func TestUpdate_CtrlCCancelsTurnWhenThinking(t *testing.T) {
 
 func TestUpdate_CtrlDSubmitsAndClears(t *testing.T) {
 	loop := newTestLoop(t, stubProvider{})
-	m := initialModel(loop, "")
+	m := initialModel(loop, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m = typeInto(m, "hello world")
 
@@ -145,7 +145,7 @@ func TestUpdate_CtrlDSubmitsAndClears(t *testing.T) {
 }
 
 func TestUpdate_CtrlDIgnoredWhileThinking(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m.thinking = true
 	m = typeInto(m, "second submit while first is running")
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
@@ -163,7 +163,7 @@ func TestUpdate_CtrlDIgnoredWhileThinking(t *testing.T) {
 }
 
 func TestUpdate_CtrlDEmptyIsNoOp(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	// No input typed. Submit anyway.
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
@@ -177,7 +177,7 @@ func TestUpdate_CtrlDEmptyIsNoOp(t *testing.T) {
 }
 
 func TestUpdate_CtrlDWhitespaceIsNoOp(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m = typeInto(m, "   \n\t  ")
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
@@ -191,7 +191,7 @@ func TestUpdate_CtrlDWhitespaceIsNoOp(t *testing.T) {
 }
 
 func TestView_EmptyShowsHelpHint(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	out := m.View()
 	if !strings.Contains(out, "no messages yet") {
@@ -200,7 +200,7 @@ func TestView_EmptyShowsHelpHint(t *testing.T) {
 }
 
 func TestView_PreWindowSizeFallback(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	// No WindowSizeMsg yet — width is 0.
 	out := m.View()
 	if !strings.Contains(out, "starting") {
@@ -209,7 +209,7 @@ func TestView_PreWindowSizeFallback(t *testing.T) {
 }
 
 func TestView_EmptyWhenQuitting(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.quitting = true
 	if out := m.View(); out != "" {
@@ -218,7 +218,7 @@ func TestView_EmptyWhenQuitting(t *testing.T) {
 }
 
 func TestUpdate_CtrlTTogglesToolsExpanded(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	if m.toolsExpanded {
 		t.Fatalf("toolsExpanded should default to false")
@@ -243,7 +243,7 @@ func TestUpdate_PageKeysScrollViewport(t *testing.T) {
 	//   - viewport content = 20 lines
 	//   - GotoBottom puts YOffset at max (>0)
 	//   - PgUp should reduce YOffset
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 80, 10)
 	// height=10 → viewport.Height = 10 - inputHeight(5) - divider(1) = 4
 	// fill with 30 distinct lines so scroll position is meaningful
@@ -277,7 +277,7 @@ func TestUpdate_PageKeysDoNotTouchTextarea(t *testing.T) {
 	// PgUp/PgDn should be intercepted before reaching the textarea.
 	// Verify by typing content first, then sending PgUp — content
 	// should be unchanged (no textarea-side effect).
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 80, 30)
 	m = typeInto(m, "do not touch me")
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
@@ -288,7 +288,7 @@ func TestUpdate_PageKeysDoNotTouchTextarea(t *testing.T) {
 }
 
 func TestUpdate_CtrlHomeAndCtrlEndJumpToTopAndBottom(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 80, 10)
 	lines := make([]string, 30)
 	for i := range lines {
@@ -315,7 +315,7 @@ func TestUpdate_CtrlTRepaintsViewport(t *testing.T) {
 	// change the rendered viewport content (different hint visibility,
 	// different body length). Simplest check: rendered output differs
 	// before vs after Ctrl-T.
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 80, 30)
 	m.history = []viewMessage{
 		{role: roleTool, toolName: "bash", content: strings.Join(
@@ -333,7 +333,7 @@ func TestUpdate_CtrlTRepaintsViewport(t *testing.T) {
 }
 
 func TestView_ThinkingIndicatorAppearsDuringTurn(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	// Refresh the viewport's cached content. In production code, the
@@ -350,7 +350,7 @@ func TestView_ThinkingIndicatorAppearsDuringTurn(t *testing.T) {
 // ---- helpers ----
 
 func TestView_StatusBarShowsModelName(t *testing.T) {
-	m := initialModel(nil, "claude-opus-9")
+	m := initialModel(nil, "claude-opus-9", nil, nil)
 	m, _ = applyWindowSize(m, 120, 30)
 	out := m.View()
 	if !strings.Contains(out, "claude-opus-9") {
@@ -359,7 +359,7 @@ func TestView_StatusBarShowsModelName(t *testing.T) {
 }
 
 func TestView_StatusBarShowsCumulativeMetrics(t *testing.T) {
-	m := initialModel(nil, "x")
+	m := initialModel(nil, "x", nil, nil)
 	m, _ = applyWindowSize(m, 120, 30)
 	// Pretend two turns happened with these accumulated totals.
 	m.tracker.CallCount = 5
@@ -385,7 +385,7 @@ func TestView_StatusBarShowsCumulativeMetrics(t *testing.T) {
 func TestUpdate_TurnCompleteAccumulatesTracker(t *testing.T) {
 	// Two consecutive turns: the per-turn trackers (the loop's
 	// returned values) sum into the model's session tracker.
-	m := initialModel(nil, "x")
+	m := initialModel(nil, "x", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 
 	// First turn lands.
@@ -420,7 +420,7 @@ func TestUpdate_TurnCompleteAccumulatesTracker(t *testing.T) {
 }
 
 func TestUpdate_TurnCompleteCapturesLatestBudget(t *testing.T) {
-	m := initialModel(nil, "x")
+	m := initialModel(nil, "x", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.lastBudget.UsagePct = 0.10 // pretend an earlier snapshot
 

@@ -2,7 +2,10 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,7 +13,9 @@ import (
 
 	"github.com/ashish-work/opendev-go/internal/agents"
 	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/session"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
@@ -160,7 +165,7 @@ func TestRunTurnCmd_ContextCancellation(t *testing.T) {
 }
 
 func TestUpdate_TurnCompleteSuccessRebuildsHistory(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.turnCancel = func() {} // dummy
@@ -198,7 +203,7 @@ func TestUpdate_TurnCompleteSuccessRebuildsHistory(t *testing.T) {
 }
 
 func TestUpdate_TurnCompleteCancellationAppendsNotice(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.history = []viewMessage{{role: roleUser, content: "hello"}}
@@ -224,7 +229,7 @@ func TestUpdate_TurnCompleteCancellationAppendsNotice(t *testing.T) {
 }
 
 func TestUpdate_TurnCompleteErrorAppendsErrorMessage(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.history = []viewMessage{{role: roleUser, content: "hello"}}
@@ -323,7 +328,7 @@ func TestTranslateMessages_UnknownRoleSkipped(t *testing.T) {
 }
 
 func TestApplyStreamEvent_TextDeltaAccumulatesIntoOneMessage(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m = applyStreamEvent(m, provider.NewTextDelta("Hel"))
 	m = applyStreamEvent(m, provider.NewTextDelta("lo "))
@@ -340,7 +345,7 @@ func TestApplyStreamEvent_TextDeltaAccumulatesIntoOneMessage(t *testing.T) {
 }
 
 func TestApplyStreamEvent_ToolCallStartResetsPending(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	// First, accumulate some assistant text.
 	m = applyStreamEvent(m, provider.NewTextDelta("Let me check"))
@@ -372,7 +377,7 @@ func TestApplyStreamEvent_ToolCallStartResetsPending(t *testing.T) {
 }
 
 func TestApplyStreamEvent_ToolCallDoneReplacesPlaceholder(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m = applyStreamEvent(m, provider.NewToolCallStart(0, "call_1", "read_file"))
 	m = applyStreamEvent(m, provider.NewToolCallDone(0, "call_1", "read_file", `{"path":"x.go"}`))
@@ -383,7 +388,7 @@ func TestApplyStreamEvent_ToolCallDoneReplacesPlaceholder(t *testing.T) {
 }
 
 func TestApplyStreamEvent_ErrorAppendsAssistantMessage(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m = applyStreamEvent(m, provider.NewTextDelta("partial"))
 	m = applyStreamEvent(m, provider.NewError(errors.New("api blew up")))
@@ -403,7 +408,7 @@ func TestApplyStreamEvent_DoneAndUsageAndDeltaIgnored(t *testing.T) {
 	// These events flow through the loop's stream but have no
 	// dedicated UI representation in this commit. Verify they don't
 	// corrupt history.
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	before := len(m.history)
 	m = applyStreamEvent(m, provider.NewDone(&provider.Response{Content: "ignored"}))
@@ -416,7 +421,7 @@ func TestApplyStreamEvent_DoneAndUsageAndDeltaIgnored(t *testing.T) {
 }
 
 func TestUpdate_StreamEventMsg_AppendsTextAndRearmsCmd(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.streamCh = make(chan provider.StreamEvent, 4)
@@ -435,7 +440,7 @@ func TestUpdate_StreamEventMsg_AppendsTextAndRearmsCmd(t *testing.T) {
 func TestUpdate_StreamSinkClosedMsg_NoOp(t *testing.T) {
 	// streamSinkClosedMsg arriving while idle (or after turnComplete)
 	// should be a no-op: don't crash, don't return a Cmd.
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 
 	next, cmd := m.Update(streamSinkClosedMsg{})
@@ -448,7 +453,7 @@ func TestUpdate_StreamSinkClosedMsg_NoOp(t *testing.T) {
 }
 
 func TestUpdate_TurnCompleteClosesStreamChannel(t *testing.T) {
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.streamCh = make(chan provider.StreamEvent, 4)
@@ -468,7 +473,7 @@ func TestUpdate_MidStreamCancellationKeepsPartialText(t *testing.T) {
 	// Simulate: user submits, two text deltas land, user cancels, the
 	// loop returns ErrInterrupted. The partial assistant message
 	// should survive AND get a "(turn cancelled)" notice.
-	m := initialModel(nil, "")
+	m := initialModel(nil, "", nil, nil)
 	m, _ = applyWindowSize(m, 100, 30)
 	m.thinking = true
 	m.history = []viewMessage{{role: roleUser, content: "long task"}}
@@ -510,6 +515,185 @@ func TestUpdate_MidStreamCancellationKeepsPartialText(t *testing.T) {
 	}
 	if !foundNotice {
 		t.Errorf("cancellation notice missing: %+v", got.history)
+	}
+}
+
+// makeHookManagerForTUI builds a hooks.Manager registering one
+// matcher for user_prompt_submit with the given command. Empty
+// matcher pattern → always-match.
+func makeHookManagerForTUI(t *testing.T, command string) *hooks.Manager {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	body := `{"hooks":{"user_prompt_submit":[{"command":` +
+		strconvQuote(command) + `}]}}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	settings, err := hooks.LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	return hooks.NewManager(settings, hooks.NewExecutor(""))
+}
+
+// strconvQuote uses json marshaling for a clean string literal
+// (no escape-management overhead).
+func strconvQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func TestUpdate_CtrlD_WithoutHooksRunsTurnDirectly(t *testing.T) {
+	// Regression: when hookManager is nil, Ctrl-D should produce
+	// the runTurnCmd + nextStreamEventCmd batch immediately (no
+	// promptSubmitResultMsg dance).
+	loop := newTestLoop(t, stubProvider{response: provider.Response{Content: "ok"}})
+	m := initialModel(loop, "", nil, nil)
+	m, _ = applyWindowSize(m, 100, 30)
+	m.textarea.SetValue("hi")
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	got := next.(model)
+	if !got.thinking {
+		t.Errorf("thinking should be true after Ctrl-D submit")
+	}
+	if got.streamCh == nil {
+		t.Errorf("streamCh should be created on the direct path")
+	}
+	if cmd == nil {
+		t.Errorf("Ctrl-D should return a Cmd (runTurn + read-event batch)")
+	}
+}
+
+func TestUpdate_CtrlD_WithHooksDefersToPromptSubmit(t *testing.T) {
+	// With a non-nil hookManager, Ctrl-D should stash ctx + input
+	// and produce firePromptSubmitCmd — NOT runTurnCmd directly.
+	// streamCh stays nil until promptSubmitResultMsg approves.
+	loop := newTestLoop(t, stubProvider{response: provider.Response{Content: "ok"}})
+	mgr := makeHookManagerForTUI(t, `echo '{}'`)
+	sess := session.New("/tmp")
+	m := initialModel(loop, "", mgr, sess)
+	m, _ = applyWindowSize(m, 100, 30)
+	m.textarea.SetValue("hi")
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	got := next.(model)
+	if !got.thinking {
+		t.Errorf("thinking should be true while prompt-submit hook runs")
+	}
+	if got.streamCh != nil {
+		t.Errorf("streamCh should not be created until prompt-submit approves; got %v",
+			got.streamCh)
+	}
+	if got.pendingTurnInput != "hi" {
+		t.Errorf("pendingTurnInput = %q, want 'hi'", got.pendingTurnInput)
+	}
+	if got.pendingTurnCtx == nil {
+		t.Errorf("pendingTurnCtx should be stashed")
+	}
+	if cmd == nil {
+		t.Errorf("Ctrl-D should return firePromptSubmitCmd")
+	}
+}
+
+func TestUpdate_PromptSubmitApprovedStartsTurn(t *testing.T) {
+	// promptSubmitResultMsg with denied=false should start the
+	// turn: create streamCh, return runTurnCmd batch.
+	loop := newTestLoop(t, stubProvider{response: provider.Response{Content: "ok"}})
+	mgr := makeHookManagerForTUI(t, `echo '{}'`)
+	sess := session.New("/tmp")
+	m := initialModel(loop, "", mgr, sess)
+	m, _ = applyWindowSize(m, 100, 30)
+	m.thinking = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.pendingTurnCtx = ctx
+	m.pendingTurnInput = "hi"
+
+	next, cmd := m.Update(promptSubmitResultMsg{prompt: "hi", denied: false})
+	got := next.(model)
+	if got.streamCh == nil {
+		t.Errorf("streamCh should be created after approval")
+	}
+	if got.pendingTurnCtx != nil || got.pendingTurnInput != "" {
+		t.Errorf("pending fields should be cleared after dispatch")
+	}
+	if cmd == nil {
+		t.Errorf("approved prompt-submit should produce a Cmd batch")
+	}
+}
+
+func TestUpdate_PromptSubmitDeniedSkipsTurn(t *testing.T) {
+	// promptSubmitResultMsg with denied=true should NOT start a
+	// turn; instead append an assistant notice and reset state.
+	loop := newTestLoop(t, stubProvider{})
+	mgr := makeHookManagerForTUI(t, `echo '{}'`)
+	sess := session.New("/tmp")
+	m := initialModel(loop, "", mgr, sess)
+	m, _ = applyWindowSize(m, 100, 30)
+	m.thinking = true
+	m.history = []viewMessage{{role: roleUser, content: "hi"}}
+	cancelCalled := false
+	m.turnCancel = func() { cancelCalled = true }
+	m.pendingTurnCtx = context.Background()
+	m.pendingTurnInput = "hi"
+
+	next, cmd := m.Update(promptSubmitResultMsg{
+		prompt: "hi",
+		denied: true,
+		reason: "contains secret",
+	})
+	got := next.(model)
+
+	if got.thinking {
+		t.Errorf("thinking should reset to false on deny")
+	}
+	if !cancelCalled {
+		t.Errorf("turnCancel should be called on deny")
+	}
+	if got.streamCh != nil {
+		t.Errorf("streamCh should not be created on deny")
+	}
+	if cmd != nil {
+		t.Errorf("deny should not return a Cmd; got %v", cmd)
+	}
+	// Last history entry should be a deny notice.
+	last := got.history[len(got.history)-1]
+	if last.role != roleAssistant {
+		t.Errorf("last entry role = %d, want roleAssistant", last.role)
+	}
+	if !strings.Contains(last.content, "contains secret") {
+		t.Errorf("deny notice should include reason; got %q", last.content)
+	}
+}
+
+func TestUpdate_StopHookDoneMsgIsNoOp(t *testing.T) {
+	m := initialModel(nil, "", nil, nil)
+	m, _ = applyWindowSize(m, 100, 30)
+	next, cmd := m.Update(stopHookDoneMsg{})
+	if cmd != nil {
+		t.Errorf("stopHookDoneMsg should not return a Cmd; got %v", cmd)
+	}
+	if _, ok := next.(model); !ok {
+		t.Errorf("Update should return a model; got %T", next)
+	}
+}
+
+func TestUpdate_TurnCompleteWithHooksFiresStopCmd(t *testing.T) {
+	// When hookManager + session are set, turnCompleteMsg should
+	// return the fireStopCmd. Without them, returns nil (regression
+	// already tested elsewhere).
+	mgr := makeHookManagerForTUI(t, `echo '{}'`)
+	sess := session.New("/tmp")
+	m := initialModel(nil, "", mgr, sess)
+	m, _ = applyWindowSize(m, 100, 30)
+	m.thinking = true
+	m.history = []viewMessage{{role: roleUser, content: "hi"}}
+
+	_, cmd := m.Update(turnCompleteMsg{result: agents.Result{}})
+	if cmd == nil {
+		t.Errorf("turnCompleteMsg with hooks wired should produce fireStopCmd")
 	}
 }
 

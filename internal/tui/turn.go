@@ -7,7 +7,9 @@ import (
 
 	"github.com/ashish-work/opendev-go/internal/agents"
 	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/session"
 )
 
 // streamSinkBufferSize is the capacity of the per-turn StreamEvent
@@ -87,6 +89,70 @@ func runTurnCmd(
 			tracker: tracker,
 			err:     err,
 		}
+	}
+}
+
+// promptSubmitResultMsg carries the outcome of the UserPromptSubmit
+// hook back to Update. denied is true when the hook gated the
+// prompt; prompt is the effective (possibly rewritten + context-
+// prepended) text to feed to the loop when denied is false.
+type promptSubmitResultMsg struct {
+	prompt string
+	denied bool
+	reason string
+}
+
+// stopHookDoneMsg is the no-op message emitted after the Stop hook
+// completes (or errors). Update handles it by returning a no-op
+// Cmd; the message exists so Bubble Tea has something to receive
+// when the goroutine the Stop fire ran on exits.
+type stopHookDoneMsg struct{}
+
+// firePromptSubmitCmd fires the UserPromptSubmit lifecycle hook on a
+// Bubble Tea goroutine, then produces promptSubmitResultMsg. Used
+// when the model's hookManager is non-nil; the no-hook fast path
+// in Update skips this entirely.
+//
+// Errors from session.FirePromptSubmit (ctx cancellation, marshal
+// failure) get folded into the denied=true branch with the error
+// string as the reason — the user sees something instead of a
+// silent skip.
+func firePromptSubmitCmd(
+	ctx context.Context,
+	sess *session.Session,
+	mgr *hooks.Manager,
+	prompt string,
+) tea.Cmd {
+	return func() tea.Msg {
+		result, err := sess.FirePromptSubmit(ctx, mgr, prompt)
+		if err != nil {
+			return promptSubmitResultMsg{
+				prompt: prompt,
+				denied: true,
+				reason: "hook error: " + err.Error(),
+			}
+		}
+		return promptSubmitResultMsg{
+			prompt: result.Prompt,
+			denied: result.Denied,
+			reason: result.Reason,
+		}
+	}
+}
+
+// fireStopCmd fires the Stop lifecycle hook on a Bubble Tea
+// goroutine. The hook is fire-and-forget; the resulting message is
+// a no-op signal so the Bubble Tea runtime doesn't lose track of
+// the spawned goroutine.
+func fireStopCmd(
+	ctx context.Context,
+	sess *session.Session,
+	mgr *hooks.Manager,
+	replyText, errStr string,
+) tea.Cmd {
+	return func() tea.Msg {
+		sess.FireStop(ctx, mgr, replyText, errStr)
+		return stopHookDoneMsg{}
 	}
 }
 

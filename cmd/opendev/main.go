@@ -21,7 +21,9 @@ import (
 	"syscall"
 
 	"github.com/ashish-work/opendev-go/internal/agents"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider/router"
+	"github.com/ashish-work/opendev-go/internal/session"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/tools/bash"
 	"github.com/ashish-work/opendev-go/internal/tools/editfile"
@@ -90,15 +92,50 @@ func main() {
 	mustRegister(registry, webfetch.New())
 	mustRegister(registry, websearch.New())
 
+	// Load hooks from ~/.opendev/settings.json + ./.opendev/settings.json.
+	// Missing files are not errors; hooks are opt-in.
+	hookSettings, err := hooks.Load(workingDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: load hooks: %v\n", err)
+		os.Exit(1)
+	}
+	var hookManager *hooks.Manager
+	if len(hookSettings.Hooks) > 0 {
+		hookManager = hooks.NewManager(hookSettings, hooks.NewExecutor(workingDir))
+	}
+
+	// Construct the session and fire SessionStart. A deny here exits
+	// the binary with the reason — admin-controlled session block.
+	sess := session.New(workingDir)
+	startResult, err := sess.FireStart(context.Background(), hookManager)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: SessionStart hook: %v\n", err)
+		os.Exit(1)
+	}
+	if startResult.Denied {
+		fmt.Fprintf(os.Stderr, "session blocked: %s\n", startResult.Reason)
+		os.Exit(1)
+	}
+	// Apply SessionStart's AdditionalContext to the system prompt.
+	effectiveSystemPrompt := *systemPrompt
+	if startResult.AdditionalContext != "" {
+		if effectiveSystemPrompt != "" {
+			effectiveSystemPrompt += "\n\n" + startResult.AdditionalContext
+		} else {
+			effectiveSystemPrompt = startResult.AdditionalContext
+		}
+	}
+
 	loop := agents.NewReactLoop(caller, registry, agents.Config{
 		Workflow: workflow.Config{
 			Execution: workflow.SlotConfig{Model: *model},
 		},
 		MaxIterations:    *maxIter,
-		SystemPrompt:     *systemPrompt,
+		SystemPrompt:     effectiveSystemPrompt,
 		WorkingDir:       workingDir,
 		MaxContextTokens: *maxContext,
 	})
+	loop.Hooks = hookManager
 
 	// Persistent total across REPL turns so the final goodbye can show
 	// cumulative cost. Each Run starts with a fresh Tracker for that
@@ -130,14 +167,37 @@ func main() {
 			break
 		}
 
-		turnCost, calls := runTurn(loop, line, sigs)
+		// UserPromptSubmit hook: gate, transform, or annotate the
+		// user's input before it reaches the loop. Deny prints the
+		// reason and keeps the user at the prompt.
+		submit, err := sess.FirePromptSubmit(context.Background(), hookManager, line)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: UserPromptSubmit hook: %v\n", err)
+			continue
+		}
+		if submit.Denied {
+			fmt.Fprintf(os.Stderr, "denied by hook: %s\n", submit.Reason)
+			continue
+		}
+
+		turnCost, calls, replyText, turnErr := runTurn(loop, submit.Prompt, sigs)
 		totalCost += turnCost
 		totalCalls += calls
+
+		// Stop hook: fire-and-forget telemetry signal for each turn.
+		var errStr string
+		if turnErr != nil {
+			errStr = turnErr.Error()
+		}
+		sess.FireStop(context.Background(), hookManager, replyText, errStr)
 	}
 
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintf(os.Stderr, "input error: %v\n", err)
 	}
+
+	// SessionEnd hook: cumulative telemetry. Fire-and-forget.
+	sess.FireEnd(context.Background(), hookManager, totalCost, totalCalls)
 
 	fmt.Printf("\ngoodbye. total cost: $%.4f over %d API calls\n",
 		totalCost, totalCalls)
@@ -147,9 +207,10 @@ func main() {
 // the assistant's reply + a per-turn status line, and handles SIGINT
 // by cancelling the per-turn ctx (NOT the program).
 //
-// Returns the cost incurred and number of API calls for this turn so
-// main can accumulate session totals.
-func runTurn(loop *agents.ReactLoop, query string, sigs <-chan os.Signal) (float64, int64) {
+// Returns: cost incurred this turn, API call count, the assistant's
+// reply text (for Stop hook payload), and any error (for Stop hook
+// payload).
+func runTurn(loop *agents.ReactLoop, query string, sigs <-chan os.Signal) (float64, int64, string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -203,7 +264,7 @@ func runTurn(loop *agents.ReactLoop, query string, sigs <-chan os.Signal) (float
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 	}
 
-	return tracker.TotalCostUSD, tracker.CallCount
+	return tracker.TotalCostUSD, tracker.CallCount, result.Content, err
 }
 
 // mustRegister fails fast on registry-wiring bugs. We only call this
