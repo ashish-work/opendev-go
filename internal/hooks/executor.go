@@ -168,7 +168,7 @@ func (e *Executor) Run(
 		}
 	}
 
-	result.Decision = parseDecision(stdout.Bytes(), matcher.Command)
+	result.Decision = parseDecision(stdout.Bytes(), result.ExitCode, matcher.Command)
 	return result, nil
 }
 
@@ -185,19 +185,71 @@ func (e *Executor) timeoutFor(matcher HookMatcher) time.Duration {
 	return DefaultHookTimeout
 }
 
-// parseDecision tries to parse hook stdout as a HookDecision JSON
-// object. Empty stdout returns the zero HookDecision. Invalid JSON
-// logs a warning and returns the zero HookDecision — hooks that
-// emit log lines instead of decisions shouldn't break the agent.
-func parseDecision(stdoutBytes []byte, command string) HookDecision {
+// defaultBlockedReason is the reason attached to an exit-2 deny
+// when the hook didn't emit a custom one on stdout. Short and
+// action-revealing; authors who want better wording emit JSON.
+const defaultBlockedReason = "blocked by hook command"
+
+// parseDecision turns a hook's stdout + exit code into a
+// HookDecision. The exit code is a secondary control channel:
+//
+//   - exit 0: parse stdout as HookDecision JSON (existing behavior).
+//     Empty stdout or invalid JSON returns the zero HookDecision —
+//     hooks that emit log lines instead of decisions don't break
+//     the agent.
+//
+//   - exit 2: block the operation. Override PermissionDecision to
+//     deny, regardless of what stdout said. If the JSON parses,
+//     keep its AdditionalContext, UpdatedInput, and Reason
+//     (so a blocking hook can still attach an explanation and
+//     rewrite input). Default Reason to defaultBlockedReason when
+//     stdout didn't supply one. Exit code wins over stdout when
+//     they disagree — shell scripts more commonly forget to print
+//     JSON than forget exit, so the exit code is the authoritative
+//     signal.
+//
+//   - other non-zero: hook itself failed (command-not-found,
+//     generic error). Stdout JSON is ignored entirely — its
+//     half-baked content shouldn't be interpreted as a decision.
+//     Empty HookDecision returned + warning logged so operators see
+//     the non-zero in slog.
+//
+// Timeout and spawn-failure paths return early from Run before this
+// function runs, so the exit code here is always >= 0.
+func parseDecision(stdoutBytes []byte, exitCode int, command string) HookDecision {
+	d := parseStdoutJSON(stdoutBytes, command, exitCode == 0)
+
+	switch exitCode {
+	case 0:
+		return d
+	case 2:
+		d.PermissionDecision = PermissionDeny
+		if d.Reason == "" {
+			d.Reason = defaultBlockedReason
+		}
+		return d
+	default:
+		slog.Warn("hooks: command exited non-zero; ignoring output",
+			"command", command, "exit_code", exitCode)
+		return HookDecision{}
+	}
+}
+
+// parseStdoutJSON unmarshals stdout into a HookDecision. logWarnings
+// controls whether malformed JSON is loud — on the exit-0 path we
+// warn (user's hook is misbehaving), on the exit-2 path we don't
+// (a JSON-less deny is a feature, not a bug).
+func parseStdoutJSON(stdoutBytes []byte, command string, logWarnings bool) HookDecision {
 	stdoutBytes = bytes.TrimSpace(stdoutBytes)
 	if len(stdoutBytes) == 0 {
 		return HookDecision{}
 	}
 	var d HookDecision
 	if err := json.Unmarshal(stdoutBytes, &d); err != nil {
-		slog.Warn("hooks: stdout not parseable as HookDecision; ignoring",
-			"command", command, "error", err)
+		if logWarnings {
+			slog.Warn("hooks: stdout not parseable as HookDecision; ignoring",
+				"command", command, "error", err)
+		}
 		return HookDecision{}
 	}
 	return d

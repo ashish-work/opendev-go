@@ -346,6 +346,204 @@ func TestExecutor_TimeoutForPicksRightValue(t *testing.T) {
 	}
 }
 
+// Tests for the exit-code protocol from #36. The executor maps:
+//   exit 0       → parse stdout JSON
+//   exit 2       → force deny (preserve other fields from JSON if any)
+//   other != 0   → ignore stdout, log + empty decision
+// These tests verify each branch end-to-end via real sh execution.
+
+func TestRun_Exit2WithEmptyStdoutForcesBlockedDeny(t *testing.T) {
+	e := NewExecutor("")
+	m := HookMatcher{Command: "exit 2"}
+	got, err := e.Run(context.Background(), HookEventPreToolUse, m, struct{}{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got.ExitCode != 2 {
+		t.Errorf("ExitCode = %d, want 2", got.ExitCode)
+	}
+	if !got.Decision.IsDeny() {
+		t.Errorf("exit 2 should force deny; got perm=%q", got.Decision.PermissionDecision)
+	}
+	if got.Decision.Reason != defaultBlockedReason {
+		t.Errorf("Reason = %q, want default %q", got.Decision.Reason, defaultBlockedReason)
+	}
+}
+
+func TestRun_Exit2WithJSONReasonPreservesReason(t *testing.T) {
+	e := NewExecutor("")
+	m := HookMatcher{
+		Command: `echo '{"reason":"bash is forbidden"}' && exit 2`,
+	}
+	got, err := e.Run(context.Background(), HookEventPreToolUse, m, struct{}{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !got.Decision.IsDeny() {
+		t.Errorf("exit 2 should force deny; got perm=%q", got.Decision.PermissionDecision)
+	}
+	if got.Decision.Reason != "bash is forbidden" {
+		t.Errorf("Reason = %q, want hook-supplied 'bash is forbidden'", got.Decision.Reason)
+	}
+}
+
+func TestRun_Exit2WithAllowJSONStillResultsInDeny(t *testing.T) {
+	// A pathological hook that prints "allow" then exits 2. Exit code
+	// wins. Reason from JSON is preserved (operator may want to see
+	// what the script tried to say).
+	e := NewExecutor("")
+	m := HookMatcher{
+		Command: `echo '{"permissionDecision":"allow","reason":"I tried"}' && exit 2`,
+	}
+	got, _ := e.Run(context.Background(), HookEventPreToolUse, m, struct{}{})
+	if !got.Decision.IsDeny() {
+		t.Errorf("exit 2 should override allow JSON; got perm=%q",
+			got.Decision.PermissionDecision)
+	}
+	if got.Decision.Reason != "I tried" {
+		t.Errorf("Reason from JSON should survive; got %q", got.Decision.Reason)
+	}
+}
+
+func TestRun_Exit2PreservesAdditionalContext(t *testing.T) {
+	// A blocking hook may still want to attach an explanation. The
+	// AdditionalContext (and UpdatedInput) flow through; only the
+	// PermissionDecision is overridden.
+	e := NewExecutor("")
+	m := HookMatcher{
+		Command: `echo '{"additionalContext":"see audit log","reason":"forbidden"}' && exit 2`,
+	}
+	got, _ := e.Run(context.Background(), HookEventPreToolUse, m, struct{}{})
+	if !got.Decision.IsDeny() {
+		t.Errorf("expected deny")
+	}
+	if got.Decision.AdditionalContext != "see audit log" {
+		t.Errorf("AdditionalContext = %q, want preserved", got.Decision.AdditionalContext)
+	}
+	if got.Decision.Reason != "forbidden" {
+		t.Errorf("Reason = %q, want hook-supplied", got.Decision.Reason)
+	}
+}
+
+func TestRun_Exit2WithMalformedJSONFallsBackToDefaultReason(t *testing.T) {
+	// JSON-less deny is intentional ergonomics. We don't warn about
+	// the parse failure (it wasn't an attempt to emit JSON).
+	e := NewExecutor("")
+	m := HookMatcher{Command: `echo not json && exit 2`}
+	got, _ := e.Run(context.Background(), HookEventPreToolUse, m, struct{}{})
+	if !got.Decision.IsDeny() {
+		t.Errorf("expected deny on exit 2 + non-JSON stdout")
+	}
+	if got.Decision.Reason != defaultBlockedReason {
+		t.Errorf("Reason = %q, want default %q", got.Decision.Reason, defaultBlockedReason)
+	}
+}
+
+func TestRun_OtherNonZeroIgnoresStdoutAllow(t *testing.T) {
+	// Exit 1 with valid allow JSON: the hook itself errored, so we
+	// ignore its half-baked output. Empty decision returned.
+	e := NewExecutor("")
+	m := HookMatcher{
+		Command: `echo '{"permissionDecision":"allow","reason":"yes"}' && exit 1`,
+	}
+	got, err := e.Run(context.Background(), HookEventPreToolUse, m, struct{}{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1", got.ExitCode)
+	}
+	if got.Decision.IsAllow() || got.Decision.IsDeny() {
+		t.Errorf("exit 1 stdout should be ignored; got perm=%q",
+			got.Decision.PermissionDecision)
+	}
+	if got.Decision.Reason != "" {
+		t.Errorf("Reason should be empty for exit 1; got %q", got.Decision.Reason)
+	}
+}
+
+func TestRun_Exit127IsLoggedAndIgnored(t *testing.T) {
+	// sh -c with a missing executable exits 127. Stdout is empty;
+	// the decision should be empty + a slog warning emitted (we
+	// don't capture slog here — just verify no false-positive
+	// decision).
+	e := NewExecutor("")
+	m := HookMatcher{Command: "/this/path/does/not/exist"}
+	got, err := e.Run(context.Background(), HookEventPreToolUse, m, struct{}{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got.ExitCode == 0 {
+		t.Errorf("expected non-zero exit; got 0")
+	}
+	if !decisionIsZero(got.Decision) {
+		t.Errorf("exit 127 should give empty decision; got %+v", got.Decision)
+	}
+}
+
+// Unit-level tests on parseDecision directly so each branch is
+// exercised without spawning a process. Complement the
+// integration tests above.
+
+func TestParseDecision_Exit0WithValidJSON(t *testing.T) {
+	got := parseDecision([]byte(`{"permissionDecision":"allow","reason":"ok"}`),
+		0, "test-command")
+	if !got.IsAllow() {
+		t.Errorf("expected allow; got perm=%q", got.PermissionDecision)
+	}
+	if got.Reason != "ok" {
+		t.Errorf("Reason = %q, want 'ok'", got.Reason)
+	}
+}
+
+func TestParseDecision_Exit0WithEmptyStdout(t *testing.T) {
+	got := parseDecision(nil, 0, "test-command")
+	if !decisionIsZero(got) {
+		t.Errorf("empty stdout + exit 0 should give zero decision; got %+v", got)
+	}
+}
+
+func TestParseDecision_Exit0WithMalformedJSON(t *testing.T) {
+	got := parseDecision([]byte(`{not json`), 0, "test-command")
+	if !decisionIsZero(got) {
+		t.Errorf("malformed JSON should fall back to zero; got %+v", got)
+	}
+}
+
+func TestParseDecision_Exit2WithEmpty(t *testing.T) {
+	got := parseDecision(nil, 2, "test-command")
+	if !got.IsDeny() {
+		t.Errorf("exit 2 should force deny; got perm=%q", got.PermissionDecision)
+	}
+	if got.Reason != defaultBlockedReason {
+		t.Errorf("Reason = %q, want default", got.Reason)
+	}
+}
+
+func TestParseDecision_Exit2WithJSONFields(t *testing.T) {
+	got := parseDecision(
+		[]byte(`{"additionalContext":"note","reason":"r"}`),
+		2, "test-command")
+	if !got.IsDeny() {
+		t.Errorf("expected deny")
+	}
+	if got.Reason != "r" {
+		t.Errorf("Reason = %q, want 'r' (preserved)", got.Reason)
+	}
+	if got.AdditionalContext != "note" {
+		t.Errorf("AdditionalContext = %q, want 'note' (preserved)", got.AdditionalContext)
+	}
+}
+
+func TestParseDecision_OtherNonZeroIgnoresStdout(t *testing.T) {
+	got := parseDecision(
+		[]byte(`{"permissionDecision":"allow"}`),
+		1, "test-command")
+	if !decisionIsZero(got) {
+		t.Errorf("exit 1 should produce zero decision; got %+v", got)
+	}
+}
+
 func TestRun_DurationLessThanTimeout(t *testing.T) {
 	// Sanity: a quick command's Duration should be << timeout.
 	e := NewExecutor("")
