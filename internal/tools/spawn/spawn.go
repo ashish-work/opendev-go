@@ -192,11 +192,52 @@ func (t *Tool) Execute(ctx context.Context, _ tools.ToolContext, raw json.RawMes
 		}, nil
 	}
 
+	// SubagentStart hook fires BEFORE we build the child loop or
+	// increment depth — the firing context is "a subagent is about
+	// to start under me." A deny refuses the spawn at the
+	// observation level (Success: false, no child loop runs, no
+	// SubagentStop). UpdatedInput and AdditionalContext are
+	// silently ignored — their semantics need a design pass
+	// deferred to v3.
+	startResult, startErr := t.fireSubagentStart(ctx, spec.Name, args.Task)
+	if startErr != nil {
+		return tools.ToolResult{
+			Output: fmt.Sprintf("subagent %q hook error: %v", spec.Name, startErr),
+			Success: false,
+			Error:   startErr.Error(),
+		}, nil
+	}
+	if startResult != nil && startResult.IsDeny() {
+		return tools.ToolResult{
+			Output: fmt.Sprintf("subagent %q blocked by hook: %s",
+				spec.Name, startResult.Reason),
+			Success: false,
+			Error:   "permission denied",
+		}, nil
+	}
+
 	childLoop := t.buildChildLoop(spec)
 	childCtx := ContextWithDepth(ctx, depth+1)
 
 	result, tracker, err := childLoop.Run(childCtx, args.Task)
+
+	// SubagentStop fires regardless of success or error — operators
+	// want to audit failed subagents as much as successful ones.
+	// Fire-and-forget: hook errors are logged inside fireSubagentStop
+	// but never propagate. Permission decisions are ignored — the
+	// subagent already ran.
+	t.fireSubagentStop(ctx, spec.Name, result.Content, tracker.TotalCostUSD)
+
 	if err != nil {
+		// Surface error via slog so operators have stderr-grep
+		// access without needing a separate hook config.
+		slog.Warn("subagent errored",
+			"agent_type", spec.Name,
+			"iterations", tracker.CallCount,
+			"cost_usd", tracker.TotalCostUSD,
+			"depth", depth+1,
+			"error", err,
+		)
 		// Preserve partial Content so the parent agent can see
 		// whatever the subagent managed to produce before the
 		// failure.
@@ -227,6 +268,65 @@ func (t *Tool) Execute(ctx context.Context, _ tools.ToolContext, raw json.RawMes
 		Output:  result.Content,
 		Success: true,
 	}, nil
+}
+
+// fireSubagentStart fires the SubagentStart hook with agentType +
+// task. Returns the merged FireResult so the caller can check
+// IsDeny(). When the Hooks manager is nil, returns (nil, nil) —
+// the caller treats that as "no opinion" and proceeds.
+//
+// agentType is the primary identifier (the matcher target) so a
+// hook config can scope to specific specs with patterns like
+// "^Build$" or "^(Explore|Planner)$".
+//
+// UpdatedInput and AdditionalContext on the FireResult are
+// silently ignored. Their semantics for a subagent (rewrite the
+// task? insert into the child's system prompt?) need a design
+// pass deferred to v3. The fields are documented as ignored in
+// the package doc comment.
+func (t *Tool) fireSubagentStart(ctx context.Context, agentType, task string) (*hooks.FireResult, error) {
+	if t.cfg.Hooks == nil {
+		return nil, nil
+	}
+	return t.cfg.Hooks.Fire(ctx, hooks.HookEventSubagentStart, agentType,
+		hooks.SubagentStartPayload{
+			AgentType: agentType,
+			Task:      task,
+		})
+}
+
+// fireSubagentStop fires the SubagentStop hook with the child's
+// result content + cost. Fire-and-forget: errors are logged but
+// not returned (the subagent has already completed; there's
+// nothing to gate). nil Hooks manager → no-op.
+//
+// cost_usd is the load-bearing field for this hook — it carries
+// the child's tracker.TotalCostUSD so external audit hooks can
+// aggregate per-subagent spend that the parent's UI doesn't
+// reflect. Addresses the cost-tracking gap flagged in #38.
+//
+// On error paths the result field is set to whatever partial
+// Content the child produced before failing. The error itself is
+// NOT in the payload (SubagentStopPayload from #32 has no error
+// field and changing it would break hooks already targeting that
+// shape). Operators wanting error detail use the slog.Warn emitted
+// alongside.
+func (t *Tool) fireSubagentStop(ctx context.Context, agentType, result string, costUSD float64) {
+	if t.cfg.Hooks == nil {
+		return
+	}
+	_, err := t.cfg.Hooks.Fire(ctx, hooks.HookEventSubagentStop, agentType,
+		hooks.SubagentStopPayload{
+			AgentType: agentType,
+			Result:    result,
+			CostUSD:   costUSD,
+		})
+	if err != nil {
+		slog.Warn("SubagentStop hook errored",
+			"agent_type", agentType,
+			"error", err,
+		)
+	}
 }
 
 // buildChildLoop assembles a ReactLoop configured for the spec's

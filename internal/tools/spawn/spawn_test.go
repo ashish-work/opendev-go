@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/agents"
 	"github.com/ashish-work/opendev-go/internal/agents/subagents"
 	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
@@ -490,6 +493,327 @@ func (n *noOpTool) Description() string     { return "no-op for filter tests" }
 func (n *noOpTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
 func (n *noOpTool) Execute(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
 	return tools.ToolResult{Output: "ok", Success: true}, nil
+}
+
+// makeHookManagerForSpawn loads a hooks.Manager from a settings.json
+// written to a temp dir with the given event → command mapping.
+// Returns the manager so spawn-tool tests can wire it onto Config.
+func makeHookManagerForSpawn(t *testing.T, eventCommands map[string]string) *hooks.Manager {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.json")
+	// Build the JSON manually so we don't depend on a specific
+	// marshaler ordering.
+	hooksMap := map[string]any{}
+	for event, command := range eventCommands {
+		hooksMap[event] = []map[string]any{{"command": command}}
+	}
+	body, _ := json.Marshal(map[string]any{"hooks": hooksMap})
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	settings, err := hooks.LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	return hooks.NewManager(settings, hooks.NewExecutor(""))
+}
+
+// newSpawnToolWithHooks wires a spawn.Tool with hooks attached, on
+// top of the same stubProvider machinery the other tests use.
+func newSpawnToolWithHooks(t *testing.T, p *stubProvider, mgr *hooks.Manager) (*Tool, *tools.Registry) {
+	t.Helper()
+	caller := agents.NewLlmCaller(p, cost.Pricing{
+		InputPricePerMillion:  1.0,
+		OutputPricePerMillion: 1.0,
+	})
+	registry := tools.NewRegistry()
+	tool := New(Config{
+		Caller:     caller,
+		Registry:   registry,
+		Workflow:   workflow.Config{Execution: workflow.SlotConfig{Model: "stub"}},
+		WorkingDir: "/tmp",
+		MaxCtx:     128_000,
+		Hooks:      mgr,
+	})
+	if err := registry.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	return tool, registry
+}
+
+func TestSubagentStart_FiresWithCorrectPayload(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.log")
+	// Hook command echoes the payload it sees on stdin to the
+	// audit file. We can then assert the agent_type and task
+	// fields landed.
+	cmd := `cat > ` + auditPath
+	mgr := makeHookManagerForSpawn(t, map[string]string{
+		"subagent_start": cmd,
+	})
+	p := &stubProvider{
+		responses: []provider.Response{{Content: "done", FinishReason: "stop"}},
+	}
+	tool, _ := newSpawnToolWithHooks(t, p, mgr)
+
+	got := invokeTool(t, tool, context.Background(), Args{
+		AgentType: "Explore",
+		Task:      "investigate",
+	})
+	if !got.Success {
+		t.Fatalf("expected Success; got Output=%q", got.Output)
+	}
+	body, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("audit not valid JSON: %v\n%s", err, body)
+	}
+	if got := payload["agent_type"]; got != "Explore" {
+		t.Errorf("agent_type = %v, want Explore", got)
+	}
+	if got := payload["task"]; got != "investigate" {
+		t.Errorf("task = %v, want 'investigate'", got)
+	}
+}
+
+func TestSubagentStart_DenyRefusesSpawn(t *testing.T) {
+	// Hook returns a deny decision. The spawn should NOT run the
+	// child loop; instead it should return an observation-level
+	// "blocked by hook" ToolResult.
+	mgr := makeHookManagerForSpawn(t, map[string]string{
+		"subagent_start": `echo '{"permissionDecision":"deny","reason":"Build subagents disabled here"}'`,
+	})
+	// The provider would error if called — so any Run call would
+	// blow up the test. We use a deliberately empty responses slice
+	// (default fall-through still returns "ok"), but the test's
+	// real proof is the audit-log check below.
+	p := &stubProvider{}
+	tool, _ := newSpawnToolWithHooks(t, p, mgr)
+
+	got := invokeTool(t, tool, context.Background(), Args{
+		AgentType: "Build",
+		Task:      "do something",
+	})
+	if got.Success {
+		t.Errorf("expected Success=false for denied spawn")
+	}
+	if !strings.Contains(got.Output, "blocked by hook") {
+		t.Errorf("Output should mention 'blocked by hook'; got %q", got.Output)
+	}
+	if !strings.Contains(got.Output, "Build subagents disabled here") {
+		t.Errorf("Output should include the hook's reason; got %q", got.Output)
+	}
+	// The stub provider's Call should NOT have been invoked
+	// because the child loop never ran.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.requests) != 0 {
+		t.Errorf("child loop should not have run; provider received %d requests",
+			len(p.requests))
+	}
+}
+
+func TestSubagentStart_DenySuppressesStop(t *testing.T) {
+	// Two audit files: one written by Start, one by Stop. After a
+	// denied Start, only the Start file should have content (the
+	// deny decision itself doesn't get logged — that hook's stdout
+	// is consumed for the deny verdict, not for audit).
+	auditDir := t.TempDir()
+	stopPath := filepath.Join(auditDir, "stop.log")
+	mgr := makeHookManagerForSpawn(t, map[string]string{
+		"subagent_start": `echo '{"permissionDecision":"deny","reason":"no"}'`,
+		"subagent_stop":  `cat > ` + stopPath,
+	})
+	tool, _ := newSpawnToolWithHooks(t, &stubProvider{}, mgr)
+
+	_ = invokeTool(t, tool, context.Background(), Args{
+		AgentType: "Build",
+		Task:      "x",
+	})
+
+	if data, err := os.ReadFile(stopPath); err == nil && len(data) > 0 {
+		t.Errorf("SubagentStop should not have fired after a deny; got %s", data)
+	}
+}
+
+func TestSubagentStop_FiresAfterSuccessWithCost(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "stop.log")
+	cmd := `cat > ` + auditPath
+	mgr := makeHookManagerForSpawn(t, map[string]string{
+		"subagent_stop": cmd,
+	})
+	p := &stubProvider{
+		responses: []provider.Response{{
+			Content:      "subagent done",
+			FinishReason: "stop",
+			Usage:        provider.Usage{PromptTokens: 100, CompletionTokens: 50},
+		}},
+	}
+	tool, _ := newSpawnToolWithHooks(t, p, mgr)
+
+	_ = invokeTool(t, tool, context.Background(), Args{
+		AgentType: "Explore",
+		Task:      "find x",
+	})
+
+	body, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("audit not valid JSON: %v\n%s", err, body)
+	}
+	if got := payload["agent_type"]; got != "Explore" {
+		t.Errorf("agent_type = %v, want Explore", got)
+	}
+	if got := payload["result"]; got != "subagent done" {
+		t.Errorf("result = %v, want 'subagent done'", got)
+	}
+	// CostUSD should be > 0 because we configured non-zero
+	// pricing and the response carried tokens.
+	cost, _ := payload["cost_usd"].(float64)
+	if cost <= 0 {
+		t.Errorf("cost_usd = %v, want > 0 (pricing was set; tokens flowed)", payload["cost_usd"])
+	}
+}
+
+func TestSubagentStop_FiresAfterErrorWithPartialResult(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "stop.log")
+	mgr := makeHookManagerForSpawn(t, map[string]string{
+		"subagent_stop": `cat > ` + auditPath,
+	})
+	// Provider always errors — child loop returns ErrLLM with
+	// empty result content. SubagentStop should still fire.
+	p := &errorProvider{err: errors.New("provider blew up")}
+	caller := agents.NewLlmCaller(p, cost.Pricing{})
+	registry := tools.NewRegistry()
+	tool := New(Config{
+		Caller:     caller,
+		Registry:   registry,
+		Workflow:   workflow.Config{Execution: workflow.SlotConfig{Model: "stub"}},
+		WorkingDir: "/tmp",
+		MaxCtx:     128_000,
+		Hooks:      mgr,
+	})
+	_ = registry.Register(tool)
+
+	got := invokeTool(t, tool, context.Background(), Args{
+		AgentType: "Explore",
+		Task:      "x",
+	})
+	if got.Success {
+		t.Errorf("expected Success=false when child errored")
+	}
+
+	body, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("read audit: %v (SubagentStop should fire even on error)", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("audit not valid JSON: %v\n%s", err, body)
+	}
+	if got := payload["agent_type"]; got != "Explore" {
+		t.Errorf("agent_type = %v, want Explore", got)
+	}
+}
+
+func TestSubagentStart_NilManagerNoOp(t *testing.T) {
+	// Spawn with no Hooks manager → both Start and Stop are no-ops
+	// (regression: existing tests pass without hooks wired).
+	p := &stubProvider{responses: []provider.Response{{Content: "ok"}}}
+	tool, _, _ := newTestTool(t, p)
+
+	got := invokeTool(t, tool, context.Background(), Args{
+		AgentType: "Explore",
+		Task:      "x",
+	})
+	if !got.Success {
+		t.Errorf("nil-hooks spawn should still succeed; got %q", got.Output)
+	}
+}
+
+func TestSubagentStart_MatcherTargetsAgentType(t *testing.T) {
+	// Two start hooks with different matchers. Only the Explore
+	// one should fire when spawning an Explore subagent.
+	auditDir := t.TempDir()
+	exploreFile := filepath.Join(auditDir, "explore.log")
+	buildFile := filepath.Join(auditDir, "build.log")
+	// Manually craft the settings to use specific matchers.
+	settingsPath := filepath.Join(auditDir, "settings.json")
+	body := `{"hooks":{"subagent_start":[
+		{"matcher":"^Explore$","command":"cat > ` + exploreFile + `"},
+		{"matcher":"^Build$","command":"cat > ` + buildFile + `"}
+	]}}`
+	if err := os.WriteFile(settingsPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	settings, err := hooks.LoadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	mgr := hooks.NewManager(settings, hooks.NewExecutor(""))
+
+	p := &stubProvider{responses: []provider.Response{{Content: "ok"}}}
+	tool, _ := newSpawnToolWithHooks(t, p, mgr)
+
+	_ = invokeTool(t, tool, context.Background(), Args{
+		AgentType: "Explore",
+		Task:      "x",
+	})
+
+	if _, err := os.Stat(exploreFile); err != nil {
+		t.Errorf("Explore-matcher hook should have fired; file missing: %v", err)
+	}
+	if _, err := os.Stat(buildFile); err == nil {
+		t.Errorf("Build-matcher hook should NOT have fired for an Explore spawn")
+	}
+}
+
+func TestSubagentStart_UpdatedInputIgnoredIn_v2(t *testing.T) {
+	// A hook returning updatedInput would conceptually rewrite the
+	// child's task. v2 deliberately ignores this; the child sees
+	// the original task. We verify by checking the request the
+	// stub provider received.
+	mgr := makeHookManagerForSpawn(t, map[string]string{
+		"subagent_start": `echo '{"updatedInput":{"task":"rewritten task"}}'`,
+	})
+	p := &stubProvider{
+		responses: []provider.Response{{Content: "ok"}},
+	}
+	tool, _ := newSpawnToolWithHooks(t, p, mgr)
+
+	_ = invokeTool(t, tool, context.Background(), Args{
+		AgentType: "Explore",
+		Task:      "ORIGINAL task",
+	})
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.requests) == 0 {
+		t.Fatal("provider never called")
+	}
+	// The child's first user message should contain "ORIGINAL task",
+	// not the rewritten one.
+	req := p.requests[0]
+	found := false
+	for _, m := range req.Messages {
+		for _, b := range m.Content {
+			if strings.Contains(b.Text, "ORIGINAL task") {
+				found = true
+			}
+			if strings.Contains(b.Text, "rewritten task") {
+				t.Errorf("rewritten task leaked into child's request: %q", b.Text)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("child request didn't include the original task")
+	}
 }
 
 // --- test helpers ---
