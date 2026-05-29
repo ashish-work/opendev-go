@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -74,6 +75,63 @@ func (r *Registry) Names() []string {
 		out = append(out, name)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// Filter returns a fresh *Registry containing only the tools whose
+// names appear in allowedNames. The receiver is not modified — every
+// call produces an independent peer registry with the same
+// Register / Get / Dispatch surface.
+//
+// Semantics:
+//
+//   - nil allowedNames     → full passthrough. Every tool from the
+//     receiver is included. Used by SubAgentSpec.Tools == nil
+//     (no restriction; e.g. the Build subagent).
+//
+//   - empty allowedNames   → empty registry. No tools allowed.
+//     Distinct from nil; useful for a hypothetical "summarize only"
+//     spec that must answer from context alone.
+//
+//   - non-empty whitelist  → only the listed names are included.
+//     Names not present in the receiver are silently dropped, with
+//     a slog.Debug log. The "silently drop unknowns" path matters
+//     because subagent specs can forward-reference tools that
+//     don't exist yet (e.g. Planner's present_plan in v2). Filter
+//     produces what it can without failing.
+//
+// Used by subagent dispatch (internal/tools/spawn) to scope each
+// child loop to its spec's advertised tool set.
+//
+// Performance: O(len(receiver) + len(allowedNames)). Filter is
+// called once per subagent spawn (not per tool call) and the
+// registries are small, so the linear cost is invisible. The
+// returned registry is independent — future Register calls on the
+// new registry don't affect the original.
+func (r *Registry) Filter(allowedNames []string) *Registry {
+	out := NewRegistry()
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if allowedNames == nil {
+		// Full passthrough: copy every entry.
+		for name, tool := range r.tools {
+			out.tools[name] = tool
+		}
+		return out
+	}
+
+	// Whitelist mode (including empty slice → empty result).
+	for _, name := range allowedNames {
+		tool, ok := r.tools[name]
+		if !ok {
+			slog.Debug("registry: Filter dropping unknown tool name",
+				"name", name)
+			continue
+		}
+		out.tools[name] = tool
+	}
 	return out
 }
 

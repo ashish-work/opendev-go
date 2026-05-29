@@ -230,21 +230,26 @@ func (t *Tool) Execute(ctx context.Context, _ tools.ToolContext, raw json.RawMes
 }
 
 // buildChildLoop assembles a ReactLoop configured for the spec's
-// role. The parent's Caller, Registry, and Hooks pass through;
-// Config takes the spec's SystemPrompt verbatim, the spec's
-// MaxIterations as the cap, and overrides the execution model
-// when spec.ModelOverride is non-empty.
+// role. Caller and Hooks pass through from the parent; the registry
+// is scoped to the spec via Registry.Filter so the subagent only
+// sees the tools its spec advertises. Config takes the spec's
+// SystemPrompt verbatim, the spec's MaxIterations as the cap, and
+// overrides the execution model when spec.ModelOverride is
+// non-empty.
 //
-// TODO(#40): once Registry.Filter([]string) lands, replace
-// t.cfg.Registry with t.cfg.Registry.Filter(spec.Tools) so the
-// subagent only sees the tools its spec advertises.
+// spec.Tools == nil → full registry (Build's case).
+// spec.Tools == [list] → only those tools (Explore / Planner case).
+// Unknown tool names in spec.Tools are silently dropped by Filter,
+// so a forward-reference like Planner's present_plan is harmless.
 func (t *Tool) buildChildLoop(spec subagents.SubAgentSpec) *agents.ReactLoop {
 	wf := t.cfg.Workflow
 	if spec.ModelOverride != "" {
 		wf.Execution.Model = spec.ModelOverride
 	}
 
-	loop := agents.NewReactLoop(t.cfg.Caller, t.cfg.Registry, agents.Config{
+	scopedRegistry := t.cfg.Registry.Filter(spec.Tools)
+
+	loop := agents.NewReactLoop(t.cfg.Caller, scopedRegistry, agents.Config{
 		Workflow:         wf,
 		MaxIterations:    spec.MaxIterations,
 		SystemPrompt:     spec.SystemPrompt,

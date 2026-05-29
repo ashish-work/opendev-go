@@ -247,3 +247,130 @@ func TestConcurrentRegistrationIsRaceFree(t *testing.T) {
 		t.Errorf("len(Names()) = %d, want %d", got, goroutines)
 	}
 }
+
+// makeFilledRegistry returns a Registry pre-loaded with the named
+// fake tools. Convenience for the Filter tests below.
+func makeFilledRegistry(t *testing.T, names ...string) *Registry {
+	t.Helper()
+	r := NewRegistry()
+	for _, n := range names {
+		if err := r.Register(successTool(n)); err != nil {
+			t.Fatalf("register %s: %v", n, err)
+		}
+	}
+	return r
+}
+
+func TestFilter_NilAllowedNamesReturnsFullPassthrough(t *testing.T) {
+	r := makeFilledRegistry(t, "alpha", "beta", "gamma")
+	got := r.Filter(nil)
+	want := []string{"alpha", "beta", "gamma"}
+	if names := got.Names(); !reflect.DeepEqual(names, want) {
+		t.Errorf("Filter(nil).Names() = %v, want %v", names, want)
+	}
+}
+
+func TestFilter_EmptySliceReturnsEmptyRegistry(t *testing.T) {
+	r := makeFilledRegistry(t, "alpha", "beta")
+	got := r.Filter([]string{})
+	if names := got.Names(); len(names) != 0 {
+		t.Errorf("Filter([]string{}).Names() = %v, want empty", names)
+	}
+}
+
+func TestFilter_WhitelistKeepsOnlyNamedTools(t *testing.T) {
+	r := makeFilledRegistry(t, "alpha", "beta", "gamma", "delta")
+	got := r.Filter([]string{"alpha", "gamma"})
+	want := []string{"alpha", "gamma"}
+	if names := got.Names(); !reflect.DeepEqual(names, want) {
+		t.Errorf("Filter([alpha,gamma]).Names() = %v, want %v", names, want)
+	}
+	// Confirm dispatch works for kept tool, fails for dropped tool.
+	if _, err := got.Dispatch(context.Background(), ToolContext{},
+		"alpha", json.RawMessage(`{}`)); err != nil {
+		t.Errorf("Dispatch alpha (kept) should succeed; got %v", err)
+	}
+	_, err := got.Dispatch(context.Background(), ToolContext{},
+		"beta", json.RawMessage(`{}`))
+	if !errors.Is(err, ErrToolNotFound) {
+		t.Errorf("Dispatch beta (dropped) should return ErrToolNotFound; got %v", err)
+	}
+}
+
+func TestFilter_UnknownNamesSilentlyDropped(t *testing.T) {
+	// Matches Planner's forward-reference pattern: present_plan
+	// doesn't exist as a tool yet, so it should be silently
+	// dropped. The known name still flows through.
+	r := makeFilledRegistry(t, "read_file", "list_files")
+	got := r.Filter([]string{"read_file", "present_plan", "list_files"})
+	want := []string{"list_files", "read_file"}
+	if names := got.Names(); !reflect.DeepEqual(names, want) {
+		t.Errorf("Filter dropped unknowns: got %v, want %v", names, want)
+	}
+}
+
+func TestFilter_DoesNotMutateOriginal(t *testing.T) {
+	// Critical: Filter is supposed to return a fresh registry
+	// without touching the receiver. If the source got mutated,
+	// the parent ReactLoop would lose tools mid-session.
+	r := makeFilledRegistry(t, "alpha", "beta", "gamma")
+	_ = r.Filter([]string{"alpha"})
+
+	want := []string{"alpha", "beta", "gamma"}
+	if names := r.Names(); !reflect.DeepEqual(names, want) {
+		t.Errorf("original registry mutated by Filter: got %v, want %v",
+			names, want)
+	}
+	// Original still dispatches non-filtered tools.
+	if _, err := r.Dispatch(context.Background(), ToolContext{},
+		"beta", json.RawMessage(`{}`)); err != nil {
+		t.Errorf("Original Dispatch beta should still work; got %v", err)
+	}
+}
+
+func TestFilter_ResultRegistryAcceptsFurtherRegistration(t *testing.T) {
+	// The returned registry should be a fully functional peer —
+	// callers can Register additional tools onto it without
+	// touching the original.
+	r := makeFilledRegistry(t, "alpha")
+	scoped := r.Filter([]string{"alpha"})
+	if err := scoped.Register(successTool("zeta")); err != nil {
+		t.Errorf("Register on filtered registry should succeed; got %v", err)
+	}
+	if _, ok := scoped.Get("zeta"); !ok {
+		t.Errorf("zeta should be registered on the filtered registry")
+	}
+	// Original shouldn't have zeta.
+	if _, ok := r.Get("zeta"); ok {
+		t.Errorf("zeta leaked into the original registry")
+	}
+}
+
+func TestFilter_EmptySourceRegistry(t *testing.T) {
+	// Calling Filter on an empty registry should return an empty
+	// registry regardless of the whitelist.
+	r := NewRegistry()
+	for _, allowed := range [][]string{
+		nil,
+		{},
+		{"unknown"},
+	} {
+		got := r.Filter(allowed)
+		if names := got.Names(); len(names) != 0 {
+			t.Errorf("Filter on empty registry with %v should be empty; got %v",
+				allowed, names)
+		}
+	}
+}
+
+func TestFilter_DuplicateNamesInWhitelistDedupNaturally(t *testing.T) {
+	// Listing the same name twice in the whitelist should be a
+	// no-op for the duplicate. Map insert in the implementation
+	// handles this naturally; we pin the behavior.
+	r := makeFilledRegistry(t, "alpha")
+	got := r.Filter([]string{"alpha", "alpha", "alpha"})
+	if names := got.Names(); !reflect.DeepEqual(names, []string{"alpha"}) {
+		t.Errorf("duplicate names should dedup; got %v", names)
+	}
+}
+

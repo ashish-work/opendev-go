@@ -396,6 +396,102 @@ func TestContextWithDepth_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestBuildChildLoop_ExploreSpecExcludesSpawnFromChildRegistry(t *testing.T) {
+	// The Explore spec's Tools whitelist is {read_file, list_files,
+	// bash} — spawn_subagent is NOT in that list. After #40's
+	// filter integration, the Explore subagent's child loop should
+	// see a registry that contains only the whitelisted tools and
+	// excludes spawn_subagent. This is the load-bearing security
+	// property: an Explore subagent cannot recursively spawn.
+	p := &stubProvider{}
+	tool, _, registry := newTestTool(t, p)
+
+	// Register the spec's tools onto the same registry so the
+	// filter has something to keep.
+	for _, name := range []string{"read_file", "list_files", "bash"} {
+		registerEcho(t, registry, name)
+	}
+
+	spec, _ := subagents.SpecByName("Explore")
+	childLoop := tool.buildChildLoop(spec)
+
+	childRegistry := childLoop.Registry
+	if _, ok := childRegistry.Get("spawn_subagent"); ok {
+		t.Errorf("child registry should NOT include spawn_subagent for Explore spec")
+	}
+	for _, want := range []string{"read_file", "list_files", "bash"} {
+		if _, ok := childRegistry.Get(want); !ok {
+			t.Errorf("child registry should include %q for Explore spec", want)
+		}
+	}
+}
+
+func TestBuildChildLoop_BuildSpecKeepsFullRegistry(t *testing.T) {
+	// Build's nil Tools means "no restriction" — the child sees
+	// the full registry including spawn_subagent (which enables
+	// nested spawning chains used by the grandchild test in #38).
+	p := &stubProvider{}
+	tool, _, registry := newTestTool(t, p)
+	for _, name := range []string{"read_file", "bash"} {
+		registerEcho(t, registry, name)
+	}
+
+	spec, _ := subagents.SpecByName("Build")
+	childLoop := tool.buildChildLoop(spec)
+
+	if _, ok := childLoop.Registry.Get("spawn_subagent"); !ok {
+		t.Errorf("Build spec child should retain spawn_subagent")
+	}
+	if _, ok := childLoop.Registry.Get("read_file"); !ok {
+		t.Errorf("Build spec child should retain read_file")
+	}
+}
+
+func TestBuildChildLoop_PlannerSpecForwardReferenceDropsPresentPlan(t *testing.T) {
+	// Planner's Tools list includes present_plan, but that tool
+	// doesn't exist as a registered Tool in v2. The filter should
+	// silently drop the unknown name; the remaining tools survive.
+	p := &stubProvider{}
+	tool, _, registry := newTestTool(t, p)
+	for _, name := range []string{"read_file", "list_files", "bash"} {
+		registerEcho(t, registry, name)
+	}
+
+	spec, _ := subagents.SpecByName("Planner")
+	childLoop := tool.buildChildLoop(spec)
+
+	if _, ok := childLoop.Registry.Get("present_plan"); ok {
+		t.Errorf("forward-referenced present_plan should be filtered out")
+	}
+	for _, want := range []string{"read_file", "list_files", "bash"} {
+		if _, ok := childLoop.Registry.Get(want); !ok {
+			t.Errorf("Planner spec should include %q", want)
+		}
+	}
+}
+
+// registerEcho is a tiny helper that registers a successful no-op
+// tool under the given name. Used by the spec-filter tests above
+// to populate the registry with the named tools each spec expects.
+func registerEcho(t *testing.T, registry *tools.Registry, name string) {
+	t.Helper()
+	echo := &noOpTool{name: name}
+	if err := registry.Register(echo); err != nil {
+		t.Fatalf("register %s: %v", name, err)
+	}
+}
+
+// noOpTool returns a successful empty ToolResult. Used only for
+// the spec-filter tests; the actual tool behavior doesn't matter.
+type noOpTool struct{ name string }
+
+func (n *noOpTool) Name() string            { return n.name }
+func (n *noOpTool) Description() string     { return "no-op for filter tests" }
+func (n *noOpTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (n *noOpTool) Execute(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+	return tools.ToolResult{Output: "ok", Success: true}, nil
+}
+
 // --- test helpers ---
 
 // errorProvider always returns the configured error on Call.
