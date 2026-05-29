@@ -81,6 +81,7 @@ opendev-go/
 │   │   └── summarize/       # rule-based tool-result summarizer
 │   ├── tui/                 # Bubble Tea Model/Update/View (powers
 │   │                        #   cmd/opendev-tui — v2 Phase 1.5+)
+│   ├── hooks/               # lifecycle hook system (Phase 6)
 │   ├── workflow/            # typed model-role slots (Execution/Thinking/...)
 │   ├── budget/              # token heuristic + API-anchored calibrator
 │   ├── cost/                # immutable cost tracker
