@@ -75,6 +75,7 @@ opendev-go/
 │   │   ├── bash/            # foreground shell command runner
 │   │   ├── editfile/        # edit_file
 │   │   │   └── match/       # 9-pass fuzzy matching chain
+│   │   ├── spawn/           # spawn_subagent (Phase 7)
 │   │   └── truncation/      # output-spillover-to-disk helper
 │   ├── agents/              # ReAct loop, prompt composition, LLM caller
 │   │   ├── doomloop/        # cycle detector

@@ -27,6 +27,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/tools/editfile"
 	"github.com/ashish-work/opendev-go/internal/tools/listfiles"
 	"github.com/ashish-work/opendev-go/internal/tools/readfile"
+	"github.com/ashish-work/opendev-go/internal/tools/spawn"
 	"github.com/ashish-work/opendev-go/internal/tools/todo"
 	"github.com/ashish-work/opendev-go/internal/tools/truncation"
 	"github.com/ashish-work/opendev-go/internal/tools/webfetch"
@@ -128,6 +129,20 @@ func main() {
 		MaxContextTokens: *maxContext,
 	})
 	loop.Hooks = hookManager
+
+	// Register spawn_subagent AFTER the other tools — it needs the
+	// shared registry, caller, and hook manager to construct child
+	// loops. The registry pointer means a nested spawn from inside
+	// a subagent sees the registry including spawn itself, so
+	// recursion (capped at DefaultMaxDepth) Just Works.
+	mustRegister(registry, spawn.New(spawn.Config{
+		Caller:     caller,
+		Registry:   registry,
+		Workflow:   workflow.Config{Execution: workflow.SlotConfig{Model: *model}},
+		WorkingDir: workingDir,
+		MaxCtx:     *maxContext,
+		Hooks:      hookManager,
+	}))
 
 	runErr := tui.Run(loop, *model, sess, hookManager)
 
