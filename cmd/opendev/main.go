@@ -155,6 +155,19 @@ func main() {
 	loop.Hooks = hookManager
 	loop.Permissions = permPolicy
 
+	// Plan-of-record injection: when the user has a todos.json
+	// under ~/.opendev/, every LLM request will see the current
+	// plan as a synthetic system message. Falling back to no
+	// injection on DefaultPath failure keeps the binary usable on
+	// systems without a writable $HOME — the todo tool itself
+	// will surface the same error if the user tries to use it.
+	if todoPath, err := todo.DefaultPath(); err == nil {
+		loop.TodoStore = todo.NewStore(todoPath)
+	} else {
+		slog.Info("todo: skipping plan injection (no default path)",
+			"err", err)
+	}
+
 	// Register spawn_subagent AFTER the other tools — it needs the
 	// shared registry, caller, and hook manager to construct child
 	// loops. The registry pointer means a nested spawn from inside

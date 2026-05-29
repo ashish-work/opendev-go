@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/ashish-work/opendev-go/internal/agents/doomloop"
@@ -124,7 +125,7 @@ func (l *ReactLoop) llmCallPhase(ctx context.Context, pc *PhaseContext) LoopActi
 	exec := l.Config.Workflow.Resolve(workflow.SlotExecution)
 	req := provider.Request{
 		Model:           exec.Model,
-		Messages:        *pc.History,
+		Messages:        l.buildRequestMessages(*pc.History),
 		Tools:           SchemasFor(l.Registry),
 		ReasoningEffort: exec.ReasoningEffort,
 	}
@@ -177,6 +178,63 @@ func (l *ReactLoop) llmCallPhase(ctx context.Context, pc *PhaseContext) LoopActi
 	pc.LastResponse = resp
 
 	return NewLoopActionContinue(pc.Tracker)
+}
+
+// todoSystemHeader prefaces the injected plan-of-record. The
+// "persisted on disk" phrasing cues the model that the plan
+// survives context compaction — it doesn't need to keep the plan
+// alive in its own text. Surfaced as a constant so the prompt
+// shape is grep-able from the test rig.
+const todoSystemHeader = "Current plan-of-record (persisted on disk):\n\n"
+
+// buildRequestMessages returns the Messages slice to send to the
+// provider. When l.TodoStore is non-nil and the loaded state has
+// at least one todo, a synthetic system message containing the
+// rendered plan is appended at the end so the model sees current
+// plan state without having to call `todo list`.
+//
+// The input slice is never mutated; the helper either returns
+// history as-is (zero new allocations on the no-injection paths)
+// or a fresh slice with the plan message appended. That keeps
+// pc.History clean across iterations — every iteration's request
+// sees fresh disk state, but the conversation log doesn't
+// accumulate stale plan snapshots.
+//
+// On Store.Load error, the helper logs at debug and skips
+// injection rather than failing the call. A flaky filesystem or
+// a midway todo-tool write shouldn't break the agent loop — the
+// model will see a slightly stale view (no plan that turn) and
+// can recover.
+//
+// Position: appended at the END of history. Late position keeps
+// the plan in recent-attention range. Both providers handle
+// scattered system messages — OpenAI accepts them inline;
+// Anthropic's extractSystem hoists them to its top-level system
+// field.
+//
+// Known limitation: Anthropic's extractSystem joins all system
+// messages into one cache_control'd block, so a plan that
+// changes each turn invalidates the system-prompt cache hit.
+// Proper fix is splitting static/dynamic system blocks with
+// cache_control only on the static prefix; deferred until
+// measurements show it matters.
+func (l *ReactLoop) buildRequestMessages(history []provider.Message) []provider.Message {
+	if l.TodoStore == nil {
+		return history
+	}
+	state, err := l.TodoStore.Load()
+	if err != nil {
+		slog.Debug("agents: todo store load failed; skipping plan injection",
+			"path", l.TodoStore.Path, "err", err)
+		return history
+	}
+	if len(state.Todos) == 0 {
+		return history
+	}
+	out := make([]provider.Message, 0, len(history)+1)
+	out = append(out, history...)
+	out = append(out, SystemMessage(todoSystemHeader+state.Render()))
+	return out
 }
 
 // processResponsePhase makes the complete-vs-tool-call decision for

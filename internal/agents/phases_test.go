@@ -20,6 +20,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/provider"
 	"github.com/ashish-work/opendev-go/internal/runtime/permissions"
 	"github.com/ashish-work/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools/todo"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
 
@@ -1979,4 +1980,209 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// writeTodoState is a test helper: writes a State JSON file under
+// a tempdir and returns the path so the loop's TodoStore can load
+// it. Keeps the fixture inline with the test so the expected
+// rendering shape is easy to eyeball next to the assertion.
+func writeTodoState(t *testing.T, state todo.State) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "todos.json")
+	store := todo.NewStore(path)
+	if err := store.Save(state); err != nil {
+		t.Fatalf("save todo state: %v", err)
+	}
+	return path
+}
+
+func TestLLMCallPhase_NilTodoStoreSkipsInjection(t *testing.T) {
+	// Backwards compat: a loop with TodoStore unset (the v1
+	// default) must produce a Request whose Messages match
+	// history exactly. No injection, no extra allocation.
+	p := &fakeProvider{responses: []provider.Response{{Content: "ok"}}}
+	loop, pc := newLLMTestRig(t, p, nil)
+	loop.TodoStore = nil
+
+	_ = loop.llmCallPhase(context.Background(), pc)
+
+	if len(p.requests) != 1 {
+		t.Fatalf("requests captured = %d, want 1", len(p.requests))
+	}
+	if got, want := len(p.requests[0].Messages), len(*pc.History); got != want {
+		t.Errorf("Request.Messages len = %d, want %d (nil store should pass history through)",
+			got, want)
+	}
+}
+
+func TestLLMCallPhase_EmptyTodoStateSkipsInjection(t *testing.T) {
+	// A configured store with no todos must not produce a
+	// "Current plan: (empty)" injection — pure noise.
+	path := writeTodoState(t, todo.State{NextID: 1})
+	p := &fakeProvider{responses: []provider.Response{{Content: "ok"}}}
+	loop, pc := newLLMTestRig(t, p, nil)
+	loop.TodoStore = todo.NewStore(path)
+
+	historyLenBefore := len(*pc.History)
+	_ = loop.llmCallPhase(context.Background(), pc)
+
+	if got, want := len(p.requests[0].Messages), historyLenBefore; got != want {
+		t.Errorf("Request.Messages len = %d, want %d (empty state should skip)",
+			got, want)
+	}
+}
+
+func TestLLMCallPhase_PopulatedTodoStateInjectsSystemMessage(t *testing.T) {
+	// Pre-seed three todos at different statuses, then verify
+	// the request gains exactly one extra system message at the
+	// END of Messages, containing the rendered plan with markers.
+	now := time.Now()
+	path := writeTodoState(t, todo.State{
+		Todos: []todo.Todo{
+			{ID: 1, Title: "read the config", Status: todo.StatusCompleted, CreatedAt: now, UpdatedAt: now},
+			{ID: 2, Title: "apply the migration", Status: todo.StatusInProgress, CreatedAt: now, UpdatedAt: now},
+			{ID: 3, Title: "run the smoke test", Status: todo.StatusPending, CreatedAt: now, UpdatedAt: now},
+		},
+		NextID: 4,
+	})
+	p := &fakeProvider{responses: []provider.Response{{Content: "ok"}}}
+	loop, pc := newLLMTestRig(t, p, nil)
+	loop.TodoStore = todo.NewStore(path)
+
+	historyLenBefore := len(*pc.History)
+	_ = loop.llmCallPhase(context.Background(), pc)
+
+	msgs := p.requests[0].Messages
+	if got, want := len(msgs), historyLenBefore+1; got != want {
+		t.Fatalf("Request.Messages len = %d, want %d (one injection)",
+			got, want)
+	}
+
+	last := msgs[len(msgs)-1]
+	if last.Role != "system" {
+		t.Errorf("injected role = %q, want system", last.Role)
+	}
+	text := joinContentText(last.Content)
+	// Header + rendered markers + each title must all show up.
+	for _, sub := range []string{
+		"Current plan-of-record",
+		"[x] 1. read the config",
+		"[~] 2. apply the migration",
+		"[ ] 3. run the smoke test",
+	} {
+		if !strings.Contains(text, sub) {
+			t.Errorf("injected content missing %q\nfull text:\n%s", sub, text)
+		}
+	}
+}
+
+func TestLLMCallPhase_TodoInjectionDoesNotMutateHistory(t *testing.T) {
+	// The helper must return a fresh slice, not mutate pc.History.
+	// Otherwise the conversation log accumulates plan snapshots
+	// across iterations and prompt caches drift unpredictably.
+	now := time.Now()
+	path := writeTodoState(t, todo.State{
+		Todos: []todo.Todo{
+			{ID: 1, Title: "step 1", Status: todo.StatusInProgress, CreatedAt: now, UpdatedAt: now},
+		},
+		NextID: 2,
+	})
+	p := &fakeProvider{responses: []provider.Response{{Content: "ok"}}}
+	loop, pc := newLLMTestRig(t, p, nil)
+	loop.TodoStore = todo.NewStore(path)
+
+	historyLenBefore := len(*pc.History)
+	historyRolesBefore := make([]string, len(*pc.History))
+	for i, m := range *pc.History {
+		historyRolesBefore[i] = m.Role
+	}
+
+	_ = loop.llmCallPhase(context.Background(), pc)
+
+	if got := len(*pc.History); got != historyLenBefore {
+		t.Errorf("pc.History len = %d, want %d (history must NOT be mutated)",
+			got, historyLenBefore)
+	}
+	for i, m := range *pc.History {
+		if m.Role != historyRolesBefore[i] {
+			t.Errorf("pc.History[%d].Role = %q, want %q (mutation detected)",
+				i, m.Role, historyRolesBefore[i])
+		}
+	}
+}
+
+func TestLLMCallPhase_TodoInjectionAcrossIterationsSeesFreshState(t *testing.T) {
+	// Two iterations: between them we update the on-disk state.
+	// Each iteration's request must reflect the disk state AT
+	// THAT MOMENT, not a cached snapshot from the first turn.
+	now := time.Now()
+	path := writeTodoState(t, todo.State{
+		Todos: []todo.Todo{
+			{ID: 1, Title: "step A", Status: todo.StatusInProgress, CreatedAt: now, UpdatedAt: now},
+		},
+		NextID: 2,
+	})
+	store := todo.NewStore(path)
+
+	p := &fakeProvider{
+		responses: []provider.Response{
+			{Content: "ok 1"},
+			{Content: "ok 2"},
+		},
+	}
+	loop, pc := newLLMTestRig(t, p, nil)
+	loop.TodoStore = store
+
+	// Iteration 1.
+	_ = loop.llmCallPhase(context.Background(), pc)
+
+	// Mutate disk state: complete step A, add step B.
+	state, err := store.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	state, err = state.CompleteOne(1, time.Now())
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	state, _ = state.WithTodos([]todo.Todo{
+		{Title: "step A"}, // re-pass to keep ID 1's record; WithTodos rewrites the slate
+		{Title: "step B"},
+	}, time.Now())
+	if err := store.Save(state); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Iteration 2 — note we must re-run llmCallPhase on the same
+	// loop; pc.Iter doesn't gate the injection.
+	pc.Iter = 2
+	_ = loop.llmCallPhase(context.Background(), pc)
+
+	if got := len(p.requests); got != 2 {
+		t.Fatalf("captured requests = %d, want 2", got)
+	}
+	first := joinContentText(p.requests[0].Messages[len(p.requests[0].Messages)-1].Content)
+	second := joinContentText(p.requests[1].Messages[len(p.requests[1].Messages)-1].Content)
+	if first == second {
+		t.Errorf("plan injection identical across iterations — must reflect mutated disk state\nfirst: %s\nsecond: %s",
+			first, second)
+	}
+	if !strings.Contains(second, "step B") {
+		t.Errorf("iteration 2 plan should mention 'step B' (added between calls); got:\n%s",
+			second)
+	}
+}
+
+// joinContentText pulls the text out of a ContentBlock slice. The
+// agents package doesn't expose a public helper for this; the
+// fakeProvider tests above access .Text directly, but the plan-
+// injection tests want the joined string for substring checks.
+func joinContentText(blocks []provider.ContentBlock) string {
+	var b strings.Builder
+	for _, c := range blocks {
+		if c.Kind == provider.ContentText {
+			b.WriteString(c.Text)
+		}
+	}
+	return b.String()
 }

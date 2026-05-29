@@ -10,6 +10,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/provider"
 	"github.com/ashish-work/opendev-go/internal/runtime/permissions"
 	"github.com/ashish-work/opendev-go/internal/tools"
+	"github.com/ashish-work/opendev-go/internal/tools/todo"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
 
@@ -81,6 +82,21 @@ type ReactLoop struct {
 	// (even if zero) so executeOneCall calls Check unconditionally.
 	// No nil-branching in the hot path.
 	Permissions permissions.Policy
+
+	// TodoStore, when non-nil, makes llmCallPhase read the
+	// persistent todo list on every request and append it to the
+	// outgoing Messages as a system-role plan-of-record. Turns the
+	// todo tool from "the model has to remember to call it" into
+	// always-on plan visibility — the model sees current plan
+	// state without explicit retrieval, and the plan survives
+	// context compaction because the on-disk store is the source
+	// of truth.
+	//
+	// Pointer (not value) because most tests and simple binaries
+	// don't configure plan injection; nil is the "feature off"
+	// path. Subagents intentionally do NOT inherit the store —
+	// they get a focused task from the parent and run isolated.
+	TodoStore *todo.Store
 }
 
 // NewReactLoop wires the loop with defaults applied for zero fields in

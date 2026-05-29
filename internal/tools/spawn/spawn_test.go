@@ -949,3 +949,38 @@ func TestBuildChildLoop_ZeroPermissionsAllowsAllInChild(t *testing.T) {
 		t.Errorf("zero Policy should Allow any tool, got Deny(%q)", d.Reason)
 	}
 }
+
+func TestBuildChildLoop_DoesNotInheritTodoStore(t *testing.T) {
+	// Subagents are isolated by design — each gets a focused task
+	// from the parent and runs in its own loop. Inheriting the
+	// parent's TodoStore would muddle the child's context (the
+	// child would see the parent's plan as if it were its own).
+	// The cleanest contract: child's TodoStore stays nil even when
+	// the parent has one wired.
+	//
+	// This test asserts buildChildLoop's behavior at the wiring
+	// level — no need to drive a full child loop run.
+	caller := agents.NewLlmCaller(&stubProvider{}, cost.Pricing{
+		InputPricePerMillion:  1.0,
+		OutputPricePerMillion: 1.0,
+	})
+	registry := tools.NewRegistry()
+	tool := New(Config{
+		Caller:     caller,
+		Registry:   registry,
+		Workflow:   workflow.Config{Execution: workflow.SlotConfig{Model: "stub"}},
+		WorkingDir: "/tmp",
+		MaxCtx:     128_000,
+	})
+
+	childLoop := tool.buildChildLoop(subagents.SubAgentSpec{
+		Name:          "Explore",
+		SystemPrompt:  "explore",
+		MaxIterations: 5,
+	})
+
+	if childLoop.TodoStore != nil {
+		t.Errorf("child loop TodoStore = %v, want nil (subagents must not inherit plan state)",
+			childLoop.TodoStore)
+	}
+}
