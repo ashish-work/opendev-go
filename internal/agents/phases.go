@@ -5,7 +5,9 @@ import (
 	"fmt"
 
 	"github.com/ashish-work/opendev-go/internal/agents/doomloop"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
 
@@ -247,29 +249,89 @@ func (l *ReactLoop) processResponsePhase(_ context.Context, pc *PhaseContext) Lo
 }
 
 // executeSequentialPhase dispatches the assistant's tool calls in
-// order and appends a ToolResultMessage for each. Two failure
-// classes:
+// order and appends a ToolResultMessage for each. Hooks intervene
+// at three points around every call:
 //
-//   - Tool-domain failures (Success: false ToolResult) — these flow
-//     into history as observations the model will react to. The
-//     phase does NOT return Return for these; the model gets to
-//     try again.
+//   - PreToolUse fires before the dispatch. If it denies, the phase
+//     appends a synthetic ToolResultMessage ("blocked by hook")
+//     and skips dispatch — the synthetic message preserves
+//     OpenAI's assistant(tool_calls) → tool_response pairing
+//     contract. If it returns UpdatedInput, the rewritten JSON
+//     replaces the model's original arguments before dispatch.
 //
-//   - Infrastructure failures (Registry.Dispatch returns an error:
-//     unknown tool, ctx cancellation surfacing from the tool,
-//     panic in the registry) — these bubble out as ErrToolExec.
-//     The name of the tool that failed is folded into the error so
-//     debugging starts with the right suspect.
+//   - PostToolUse fires after a successful dispatch.
+//
+//   - PostToolUseFailure fires after an infrastructure error
+//     (Registry.Dispatch returned an error) before the phase bails
+//     with ErrToolExec.
+//
+// AdditionalContext from any hook is appended as a SystemMessage
+// AFTER the tool result — never between the assistant tool_call
+// message and its paired tool_response, which would break the
+// pairing (same shape as doom-loop Redirect/Notify in
+// handle_completion).
+//
+// Two failure classes still flow through:
+//
+//   - Tool-domain failures (Success: false ToolResult) — flow into
+//     history as observations the model will react to. The phase
+//     does NOT return Return for these.
+//   - Infrastructure failures (Registry.Dispatch returns an error)
+//     — bubble out as ErrToolExec after PostToolUseFailure fires.
 //
 // Dispatched in order. v1 doesn't parallelize tool calls; Phase 7
 // adds parallel dispatch for the homogeneous-spawn_subagent batch
 // case but leaves the sequential path here as the default.
 func (l *ReactLoop) executeSequentialPhase(ctx context.Context, pc *PhaseContext) LoopAction {
 	for _, call := range pc.LastResponse.ToolCalls {
-		result, dispatchErr := l.Registry.Dispatch(
-			ctx, pc.ToolCtx, call.Name, ensureJSON(call.Arguments),
-		)
+		args := ensureJSON(call.Arguments)
+
+		// 1. PreToolUse — gate, transform, or annotate.
+		preResult, err := l.fireHook(ctx, hooks.HookEventPreToolUse, call.Name,
+			hooks.PreToolUsePayload{Tool: call.Name, Args: args})
+		if err != nil || ctx.Err() != nil {
+			// Either Manager.Fire returned ctx.Err() (it was
+			// already cancelled going in) or the ctx was cancelled
+			// while a per-hook command was running and the hook
+			// kill propagated as a per-hook infrastructure error.
+			// Either way the right semantic is "user wants out."
+			cause := err
+			if cause == nil {
+				cause = ctx.Err()
+			}
+			return NewLoopActionReturn(
+				Result{
+					Messages:    *pc.History,
+					Interrupted: true,
+					Budget:      pc.Snapshot(),
+				},
+				fmt.Errorf("%w: iter %d: %v", ErrInterrupted, pc.Iter, cause),
+				pc.Tracker,
+			)
+		}
+		if preResult.IsDeny() {
+			pc.AppendMessage(ToolResultMessage(call.ID, call.Name, tools.ToolResult{
+				Output:  fmt.Sprintf("blocked by hook: %s", preResult.Reason),
+				Success: false,
+				Error:   "permission denied",
+			}))
+			appendHookContext(pc, preResult.AdditionalContext)
+			continue
+		}
+		if len(preResult.UpdatedInput) > 0 {
+			args = preResult.UpdatedInput
+		}
+
+		// 2. Dispatch.
+		result, dispatchErr := l.Registry.Dispatch(ctx, pc.ToolCtx, call.Name, args)
 		if dispatchErr != nil {
+			// 3a. PostToolUseFailure — fire but ignore the verdict
+			// since we're bailing anyway.
+			_, _ = l.fireHook(ctx, hooks.HookEventPostToolUseFailure, call.Name,
+				hooks.PostToolUseFailurePayload{
+					Tool:  call.Name,
+					Error: dispatchErr.Error(),
+				})
 			return NewLoopActionReturn(
 				Result{
 					Messages: *pc.History,
@@ -279,9 +341,67 @@ func (l *ReactLoop) executeSequentialPhase(ctx context.Context, pc *PhaseContext
 				pc.Tracker,
 			)
 		}
+
+		// 3b. PostToolUse — collect annotation for the model.
+		postResult, err := l.fireHook(ctx, hooks.HookEventPostToolUse, call.Name,
+			hooks.PostToolUsePayload{
+				Tool:    call.Name,
+				Output:  result.Output,
+				Success: result.Success,
+			})
+		if err != nil || ctx.Err() != nil {
+			cause := err
+			if cause == nil {
+				cause = ctx.Err()
+			}
+			return NewLoopActionReturn(
+				Result{
+					Messages:    *pc.History,
+					Interrupted: true,
+					Budget:      pc.Snapshot(),
+				},
+				fmt.Errorf("%w: iter %d: %v", ErrInterrupted, pc.Iter, cause),
+				pc.Tracker,
+			)
+		}
+
+		// 4. Append tool result, then drained AdditionalContext.
 		pc.AppendMessage(ToolResultMessage(call.ID, call.Name, result))
+		appendHookContext(pc, preResult.AdditionalContext)
+		appendHookContext(pc, postResult.AdditionalContext)
 	}
 	return NewLoopActionContinue(pc.Tracker)
+}
+
+// fireHook is the nil-safe wrapper that phase code uses instead of
+// calling l.Hooks.Fire directly. When l.Hooks is nil (no settings
+// file, no hooks configured) it returns an empty FireResult so the
+// phase reads the same shape whether or not hooks are wired.
+//
+// Errors from Manager.Fire propagate up — currently only ctx
+// cancellation surfaces here (per-hook infrastructure errors are
+// swallowed inside Fire and recorded on per-hook outcomes).
+func (l *ReactLoop) fireHook(
+	ctx context.Context,
+	event hooks.HookEvent,
+	identifier string,
+	payload any,
+) (*hooks.FireResult, error) {
+	if l.Hooks == nil {
+		return &hooks.FireResult{}, nil
+	}
+	return l.Hooks.Fire(ctx, event, identifier, payload)
+}
+
+// appendHookContext appends a hook's AdditionalContext as a system
+// message when it's non-empty. Skips empty strings so a hook that
+// chose not to comment doesn't leave a blank system message in
+// history.
+func appendHookContext(pc *PhaseContext, context string) {
+	if context == "" {
+		return
+	}
+	pc.AppendMessage(SystemMessage(context))
 }
 
 // handleCompletionPhase is the post-dispatch finalizer. Currently it

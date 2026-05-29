@@ -4,11 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/ashish-work/opendev-go/internal/agents/doomloop"
 	"github.com/ashish-work/opendev-go/internal/budget"
 	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
@@ -889,6 +894,449 @@ func TestHandleCompletionPhase_ForceStopDoesNotAppend(t *testing.T) {
 	if len(*pc.History) != before {
 		t.Errorf("ForceStop should not append in handle_completion; len = %d, want %d",
 			len(*pc.History), before)
+	}
+}
+
+// makeHookMatcher builds a HookMatcher with the regex compiled.
+// Tests that integrate hooks construct matchers by hand rather than
+// going through the JSON loader. The exported compiled field has to
+// be set via the same internal mechanism LoadFile uses; we use
+// regexp.Compile directly and call .Matches to verify Behavior
+// elsewhere — this helper only needs to populate the source string
+// + command + (optional) timeout, since matcher matching for these
+// tests uses the empty-matcher-always-matches path in most cases.
+func makeHookMatcher(t *testing.T, pattern, command string) hooks.HookMatcher {
+	t.Helper()
+	// LoadFile's compileMatchers is internal, so we construct a
+	// minimal settings file and parse it.
+	var settings hooks.HookSettings
+	if pattern == "" {
+		// Skip the JSON dance for empty matchers; the public API
+		// already says empty patterns always match.
+		return hooks.HookMatcher{Command: command}
+	}
+	tmp := writeTempSettings(t, pattern, command)
+	var err error
+	settings, err = hooks.LoadFile(tmp)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	matchers := settings.MatchersFor(hooks.HookEventPreToolUse)
+	if len(matchers) != 1 {
+		t.Fatalf("expected 1 matcher; got %d", len(matchers))
+	}
+	return matchers[0]
+}
+
+// writeTempSettings writes a one-matcher settings file under
+// pre_tool_use and returns the path.
+func writeTempSettings(t *testing.T, pattern, command string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "settings.json")
+	patternJSON, _ := json.Marshal(pattern)
+	commandJSON, _ := json.Marshal(command)
+	body := `{"hooks":{"pre_tool_use":[{"matcher":` +
+		string(patternJSON) + `,"command":` + string(commandJSON) + `}]}}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	return path
+}
+
+// newHookExecuteTestRig builds a *ReactLoop with the given tool
+// registered AND a Hooks manager configured with `matchers` under
+// the given event. Returns the loop, the pc primed with one
+// tool_call to dispatch, and a pointer to the underlying fakeTool
+// so tests can inspect whether it was actually called.
+func newHookExecuteTestRig(
+	t *testing.T,
+	tool *fakeTool,
+	event hooks.HookEvent,
+	matchers []hooks.HookMatcher,
+) (*ReactLoop, *PhaseContext) {
+	t.Helper()
+	reg := tools.NewRegistry()
+	if tool != nil {
+		if err := reg.Register(tool); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	settings := hooks.HookSettings{
+		Hooks: map[hooks.HookEvent][]hooks.HookMatcher{event: matchers},
+	}
+	loop := &ReactLoop{
+		Registry: reg,
+		Config:   Config{SystemPrompt: "sys"},
+		Hooks:    hooks.NewManager(settings, hooks.NewExecutor("")),
+	}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(
+		&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.Iter = 1
+	pc.LastResponse = provider.Response{
+		ToolCalls: []provider.ToolCall{{
+			ID:        "c1",
+			Name:      tool.name,
+			Arguments: json.RawMessage(`{"original":true}`),
+		}},
+	}
+	return loop, pc
+}
+
+func TestExecuteSequentialPhase_PreToolUseAllowDispatchesNormally(t *testing.T) {
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "tool result", Success: true}, nil
+		},
+	}
+	matcher := makeHookMatcher(t, "",
+		`echo '{"permissionDecision":"allow"}'`)
+	loop, pc := newHookExecuteTestRig(t, tool, hooks.HookEventPreToolUse,
+		[]hooks.HookMatcher{matcher})
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if tool.calls != 1 {
+		t.Errorf("tool.calls = %d, want 1 (allow should dispatch)", tool.calls)
+	}
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3", got)
+	}
+	if (*pc.History)[2].Role != "tool" {
+		t.Errorf("appended role = %q, want tool", (*pc.History)[2].Role)
+	}
+}
+
+func TestExecuteSequentialPhase_PreToolUseDenySkipsDispatch(t *testing.T) {
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			t.Errorf("tool.Execute should NOT have been called on deny")
+			return tools.ToolResult{}, nil
+		},
+	}
+	matcher := makeHookMatcher(t, "",
+		`echo '{"permissionDecision":"deny","reason":"forbidden by policy"}'`)
+	loop, pc := newHookExecuteTestRig(t, tool, hooks.HookEventPreToolUse,
+		[]hooks.HookMatcher{matcher})
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue (deny is observation, not error)", action.Kind)
+	}
+	if tool.calls != 0 {
+		t.Errorf("tool.calls = %d, want 0 (deny should skip dispatch)", tool.calls)
+	}
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3 (synthetic blocked result appended)", got)
+	}
+	last := (*pc.History)[2]
+	if last.Role != "tool" {
+		t.Errorf("appended role = %q, want tool (synthetic ToolResultMessage)", last.Role)
+	}
+	if last.ToolCallID != "c1" {
+		t.Errorf("ToolCallID = %q, want c1 (pairing preserved)", last.ToolCallID)
+	}
+	if !strings.Contains(last.Content[0].Text, "forbidden by policy") {
+		t.Errorf("blocked output should mention the reason; got %q", last.Content[0].Text)
+	}
+}
+
+func TestExecuteSequentialPhase_PreToolUseUpdatedInputReplacesArgs(t *testing.T) {
+	var receivedArgs json.RawMessage
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, args json.RawMessage) (tools.ToolResult, error) {
+			receivedArgs = args
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+	matcher := makeHookMatcher(t, "",
+		`echo '{"updatedInput":{"rewritten":true}}'`)
+	loop, pc := newHookExecuteTestRig(t, tool, hooks.HookEventPreToolUse,
+		[]hooks.HookMatcher{matcher})
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if !strings.Contains(string(receivedArgs), "rewritten") {
+		t.Errorf("tool received args = %q, want rewritten JSON", receivedArgs)
+	}
+	if strings.Contains(string(receivedArgs), "original") {
+		t.Errorf("original args should NOT reach the tool; got %q", receivedArgs)
+	}
+}
+
+func TestExecuteSequentialPhase_PreToolUseContextAppendedAfterToolResult(t *testing.T) {
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "tool output", Success: true}, nil
+		},
+	}
+	matcher := makeHookMatcher(t, "",
+		`echo '{"additionalContext":"audit logged"}'`)
+	loop, pc := newHookExecuteTestRig(t, tool, hooks.HookEventPreToolUse,
+		[]hooks.HookMatcher{matcher})
+
+	_ = loop.executeSequentialPhase(context.Background(), pc)
+	// History: system, user, tool, system(context) — order matters
+	// because the tool_call → tool_response pairing must not have
+	// anything between.
+	if got := len(*pc.History); got != 4 {
+		t.Fatalf("history len = %d, want 4", got)
+	}
+	if (*pc.History)[2].Role != "tool" {
+		t.Errorf("history[2].Role = %q, want tool (must come immediately after tool_call)",
+			(*pc.History)[2].Role)
+	}
+	if (*pc.History)[3].Role != "system" {
+		t.Errorf("history[3].Role = %q, want system (PreToolUse context)",
+			(*pc.History)[3].Role)
+	}
+	if !strings.Contains((*pc.History)[3].Content[0].Text, "audit logged") {
+		t.Errorf("system message should contain hook context")
+	}
+}
+
+func TestExecuteSequentialPhase_PostToolUseContextAppendedAfterResult(t *testing.T) {
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+	matcher := makeHookMatcher(t, "",
+		`echo '{"additionalContext":"post-hook note"}'`)
+	loop, pc := newHookExecuteTestRig(t, tool, hooks.HookEventPostToolUse,
+		[]hooks.HookMatcher{matcher})
+
+	_ = loop.executeSequentialPhase(context.Background(), pc)
+	last := (*pc.History)[len(*pc.History)-1]
+	if last.Role != "system" {
+		t.Errorf("last role = %q, want system", last.Role)
+	}
+	if !strings.Contains(last.Content[0].Text, "post-hook note") {
+		t.Errorf("PostToolUse context not appended: %q", last.Content[0].Text)
+	}
+}
+
+func TestExecuteSequentialPhase_BothPreAndPostContextAppearedInOrder(t *testing.T) {
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+	preMatcher := makeHookMatcher(t, "",
+		`echo '{"additionalContext":"pre note"}'`)
+	postMatcher := makeHookMatcher(t, "",
+		`echo '{"additionalContext":"post note"}'`)
+
+	reg := tools.NewRegistry()
+	_ = reg.Register(tool)
+	settings := hooks.HookSettings{
+		Hooks: map[hooks.HookEvent][]hooks.HookMatcher{
+			hooks.HookEventPreToolUse:  {preMatcher},
+			hooks.HookEventPostToolUse: {postMatcher},
+		},
+	}
+	loop := &ReactLoop{
+		Registry: reg,
+		Config:   Config{SystemPrompt: "sys"},
+		Hooks:    hooks.NewManager(settings, hooks.NewExecutor("")),
+	}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(
+		&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.Iter = 1
+	pc.LastResponse = provider.Response{
+		ToolCalls: []provider.ToolCall{{ID: "c1", Name: "foo"}},
+	}
+
+	_ = loop.executeSequentialPhase(context.Background(), pc)
+	// Expected: system, user, tool, system(pre note), system(post note)
+	if got := len(*pc.History); got != 5 {
+		t.Fatalf("history len = %d, want 5", got)
+	}
+	pre := (*pc.History)[3]
+	post := (*pc.History)[4]
+	if !strings.Contains(pre.Content[0].Text, "pre note") {
+		t.Errorf("expected 'pre note' at index 3; got %q", pre.Content[0].Text)
+	}
+	if !strings.Contains(post.Content[0].Text, "post note") {
+		t.Errorf("expected 'post note' at index 4; got %q", post.Content[0].Text)
+	}
+}
+
+func TestExecuteSequentialPhase_DenySecondToolFirstStillDispatches(t *testing.T) {
+	// Two tool_calls in the same iteration: the matcher denies only
+	// when called for the second tool. The first should dispatch
+	// normally; the second should be blocked.
+	calls := []string{}
+	makeTool := func(name string) *fakeTool {
+		return &fakeTool{
+			name:   name,
+			schema: json.RawMessage(`{"type":"object"}`),
+			exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+				calls = append(calls, name)
+				return tools.ToolResult{Output: name, Success: true}, nil
+			},
+		}
+	}
+	t1 := makeTool("alpha")
+	t2 := makeTool("beta")
+
+	matcher := hooks.HookMatcher{
+		Matcher: "^beta$",
+		Command: `echo '{"permissionDecision":"deny","reason":"no beta"}'`,
+	}
+	// Compile the matcher via the public loader path.
+	tmp := writeTempSettings(t, "^beta$",
+		`echo '{"permissionDecision":"deny","reason":"no beta"}'`)
+	settings, err := hooks.LoadFile(tmp)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	matcher = settings.MatchersFor(hooks.HookEventPreToolUse)[0]
+
+	reg := tools.NewRegistry()
+	_ = reg.Register(t1)
+	_ = reg.Register(t2)
+	loop := &ReactLoop{
+		Registry: reg,
+		Config:   Config{SystemPrompt: "sys"},
+		Hooks: hooks.NewManager(
+			hooks.HookSettings{Hooks: map[hooks.HookEvent][]hooks.HookMatcher{
+				hooks.HookEventPreToolUse: {matcher},
+			}},
+			hooks.NewExecutor("")),
+	}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.LastResponse = provider.Response{
+		ToolCalls: []provider.ToolCall{
+			{ID: "c1", Name: "alpha"},
+			{ID: "c2", Name: "beta"},
+		},
+	}
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if len(calls) != 1 || calls[0] != "alpha" {
+		t.Errorf("dispatch sequence = %v, want [alpha] (beta blocked)", calls)
+	}
+	// History: system, user, tool(alpha-result), tool(beta-blocked-synthetic)
+	if got := len(*pc.History); got != 4 {
+		t.Fatalf("history len = %d, want 4", got)
+	}
+	if (*pc.History)[3].ToolCallID != "c2" {
+		t.Errorf("synthetic blocked entry should pair with c2; got %q",
+			(*pc.History)[3].ToolCallID)
+	}
+}
+
+func TestExecuteSequentialPhase_CtxCancelDuringPreToolUseReturnsErrInterrupted(t *testing.T) {
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{}, nil
+		},
+	}
+	matcher := makeHookMatcher(t, "", "sleep 10") // would block forever
+	loop, pc := newHookExecuteTestRig(t, tool, hooks.HookEventPreToolUse,
+		[]hooks.HookMatcher{matcher})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	action := loop.executeSequentialPhase(ctx, pc)
+	if action.Kind != LoopActionReturn {
+		t.Fatalf("Kind = %s, want return", action.Kind)
+	}
+	if !errors.Is(action.Err, ErrInterrupted) {
+		t.Errorf("err = %v, want chain containing ErrInterrupted", action.Err)
+	}
+}
+
+func TestExecuteSequentialPhase_PreToolUseTimeoutDoesNotHaltDispatch(t *testing.T) {
+	// Per-hook timeout is swallowed by the manager. The phase
+	// should treat it as "no opinion" and dispatch normally. Build
+	// the matcher directly so TimeoutMs is unambiguous (LoadFile
+	// returns a value, and chaining mutations through the slice
+	// can mask intent).
+	dispatched := false
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			dispatched = true
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+	matcher := hooks.HookMatcher{
+		Command:   "sleep 10",
+		TimeoutMs: 200,
+	}
+	loop, pc := newHookExecuteTestRig(t, tool, hooks.HookEventPreToolUse,
+		[]hooks.HookMatcher{matcher})
+
+	start := time.Now()
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	elapsed := time.Since(start)
+
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue (timeout = no opinion); err = %v",
+			action.Kind, action.Err)
+	}
+	if !dispatched {
+		t.Errorf("tool should have dispatched after PreToolUse timeout")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("phase took %s — timeout apparently not enforced", elapsed)
+	}
+}
+
+func TestExecuteSequentialPhase_NilHooksRegressionSafe(t *testing.T) {
+	// Loop without a Hooks manager should behave exactly as the
+	// pre-#34 version. Pinned defensively.
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+	loop, pc := newExecuteTestRig(t, tool, provider.Response{
+		ToolCalls: []provider.ToolCall{{ID: "c1", Name: "foo"}},
+	})
+	// loop.Hooks is nil because newExecuteTestRig doesn't set it.
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Errorf("Kind = %s, want continue", action.Kind)
+	}
+	if got := len(*pc.History); got != 3 {
+		t.Errorf("history len = %d, want 3 (no hooks = pre-#34 behavior)", got)
 	}
 }
 

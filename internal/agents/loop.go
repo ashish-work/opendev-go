@@ -6,6 +6,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/agents/doomloop"
 	"github.com/ashish-work/opendev-go/internal/budget"
 	"github.com/ashish-work/opendev-go/internal/cost"
+	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
@@ -60,6 +61,13 @@ type ReactLoop struct {
 	Caller   *LlmCaller
 	Registry *tools.Registry
 	Config   Config
+
+	// Hooks dispatches lifecycle events to user-configured shell
+	// commands at the points defined by hooks.HookEvent. nil is
+	// valid and means "no hooks fire" — the loop behaves exactly
+	// as it did before Phase 6 landed. Binary wiring (#35) sets
+	// this field when settings.json registers any hooks.
+	Hooks *hooks.Manager
 }
 
 // NewReactLoop wires the loop with defaults applied for zero fields in
