@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1337,6 +1340,315 @@ func TestExecuteSequentialPhase_NilHooksRegressionSafe(t *testing.T) {
 	}
 	if got := len(*pc.History); got != 3 {
 		t.Errorf("history len = %d, want 3 (no hooks = pre-#34 behavior)", got)
+	}
+}
+
+func TestIsHomogeneousSpawnBatch(t *testing.T) {
+	cases := []struct {
+		name  string
+		calls []provider.ToolCall
+		want  bool
+	}{
+		{
+			name:  "empty batch",
+			calls: nil,
+			want:  false,
+		},
+		{
+			name:  "single spawn",
+			calls: []provider.ToolCall{{Name: spawnSubagentToolName}},
+			want:  false, // single-call optimization
+		},
+		{
+			name: "two spawns",
+			calls: []provider.ToolCall{
+				{Name: spawnSubagentToolName},
+				{Name: spawnSubagentToolName},
+			},
+			want: true,
+		},
+		{
+			name: "three spawns",
+			calls: []provider.ToolCall{
+				{Name: spawnSubagentToolName},
+				{Name: spawnSubagentToolName},
+				{Name: spawnSubagentToolName},
+			},
+			want: true,
+		},
+		{
+			name: "spawn plus other",
+			calls: []provider.ToolCall{
+				{Name: spawnSubagentToolName},
+				{Name: "bash"},
+			},
+			want: false,
+		},
+		{
+			name: "all other",
+			calls: []provider.ToolCall{
+				{Name: "bash"},
+				{Name: "read_file"},
+			},
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isHomogeneousSpawnBatch(c.calls); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// timingTool is a fakeTool that name-matches spawn_subagent (so the
+// homogeneous-batch detector picks it up) and tracks when each
+// invocation started + the max concurrent in-flight count.
+type timingTool struct {
+	mu          sync.Mutex
+	startTimes  []time.Time
+	inFlight    int
+	maxInFlight int
+	sleepFor    time.Duration
+}
+
+func (t *timingTool) Name() string            { return spawnSubagentToolName }
+func (t *timingTool) Description() string     { return "fake spawn for tests" }
+func (t *timingTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (t *timingTool) Execute(ctx context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+	t.mu.Lock()
+	t.startTimes = append(t.startTimes, time.Now())
+	t.inFlight++
+	if t.inFlight > t.maxInFlight {
+		t.maxInFlight = t.inFlight
+	}
+	t.mu.Unlock()
+
+	select {
+	case <-time.After(t.sleepFor):
+	case <-ctx.Done():
+	}
+
+	t.mu.Lock()
+	t.inFlight--
+	t.mu.Unlock()
+	return tools.ToolResult{Output: "ok", Success: true}, nil
+}
+
+// newParallelTestRig builds a *ReactLoop + *PhaseContext primed
+// with the given pc.LastResponse.ToolCalls, plus a timingTool
+// registered under spawn_subagent. Returns the loop, pc, and the
+// timingTool for inspection.
+func newParallelTestRig(t *testing.T, calls []provider.ToolCall, sleepFor time.Duration) (*ReactLoop, *PhaseContext, *timingTool) {
+	t.Helper()
+	tt := &timingTool{sleepFor: sleepFor}
+	reg := tools.NewRegistry()
+	if err := reg.Register(tt); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	loop := &ReactLoop{
+		Registry: reg,
+		Config:   Config{SystemPrompt: "sys"},
+	}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.LastResponse = provider.Response{ToolCalls: calls}
+	return loop, pc, tt
+}
+
+func TestExecuteSequentialPhase_ParallelSpawnBatchRunsConcurrently(t *testing.T) {
+	// Three "spawn" calls each sleep 200ms. If serial, total
+	// wall-clock would be ~600ms. If parallel, ~200ms (max of the
+	// three). Allow generous margin for test environment slowness.
+	calls := []provider.ToolCall{
+		{ID: "c1", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+		{ID: "c2", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+		{ID: "c3", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+	}
+	loop, pc, tt := newParallelTestRig(t, calls, 200*time.Millisecond)
+
+	start := time.Now()
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	elapsed := time.Since(start)
+
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("elapsed = %s, want <500ms (sequential would be ~600ms)", elapsed)
+	}
+	if tt.maxInFlight < 2 {
+		t.Errorf("maxInFlight = %d, want >=2 (proves parallelism)", tt.maxInFlight)
+	}
+	// History should have 3 tool results in declaration order.
+	if got := len(*pc.History); got != 5 { // sys + user + 3 tool results
+		t.Fatalf("history len = %d, want 5", got)
+	}
+	for i, want := range []string{"c1", "c2", "c3"} {
+		if got := (*pc.History)[2+i].ToolCallID; got != want {
+			t.Errorf("history[%d].ToolCallID = %q, want %q", 2+i, got, want)
+		}
+	}
+}
+
+func TestExecuteSequentialPhase_ParallelSpawnBatchPreservesOrder(t *testing.T) {
+	// Five spawns with random sleep durations. Whichever finishes
+	// first/last, history must reflect the original tool_call
+	// order (c1, c2, c3, c4, c5).
+	calls := []provider.ToolCall{
+		{ID: "c1", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+		{ID: "c2", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+		{ID: "c3", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+		{ID: "c4", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+		{ID: "c5", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+	}
+	loop, pc, _ := newParallelTestRig(t, calls, 50*time.Millisecond)
+
+	_ = loop.executeSequentialPhase(context.Background(), pc)
+
+	want := []string{"c1", "c2", "c3", "c4", "c5"}
+	for i, w := range want {
+		got := (*pc.History)[2+i].ToolCallID
+		if got != w {
+			t.Errorf("history[%d].ToolCallID = %q, want %q (declaration order)",
+				2+i, got, w)
+		}
+	}
+}
+
+func TestExecuteSequentialPhase_ParallelSpawnBatchCapsConcurrency(t *testing.T) {
+	// Six spawns, each sleeping 200ms. Semaphore caps in-flight at
+	// MaxParallelSpawn (4). Verify maxInFlight stayed <= cap.
+	calls := make([]provider.ToolCall, 6)
+	for i := range calls {
+		calls[i] = provider.ToolCall{
+			ID:        fmt.Sprintf("c%d", i),
+			Name:      spawnSubagentToolName,
+			Arguments: json.RawMessage(`{}`),
+		}
+	}
+	loop, pc, tt := newParallelTestRig(t, calls, 200*time.Millisecond)
+
+	_ = loop.executeSequentialPhase(context.Background(), pc)
+
+	if tt.maxInFlight > MaxParallelSpawn {
+		t.Errorf("maxInFlight = %d, want <= MaxParallelSpawn (%d)",
+			tt.maxInFlight, MaxParallelSpawn)
+	}
+}
+
+func TestExecuteSequentialPhase_MixedBatchFallsBackToSequential(t *testing.T) {
+	// Mixed spawn + other tool stays on the sequential path —
+	// no parallelism, dispatch order matches tool_call order.
+	var dispatched []string
+	var mu sync.Mutex
+	recordingTool := &fakeTool{
+		name:   "recorder",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			mu.Lock()
+			dispatched = append(dispatched, "recorder")
+			mu.Unlock()
+			return tools.ToolResult{Output: "rec", Success: true}, nil
+		},
+	}
+	spawnRecorder := &fakeTool{
+		name:   spawnSubagentToolName,
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			mu.Lock()
+			dispatched = append(dispatched, spawnSubagentToolName)
+			mu.Unlock()
+			return tools.ToolResult{Output: "spawn", Success: true}, nil
+		},
+	}
+	reg := tools.NewRegistry()
+	_ = reg.Register(recordingTool)
+	_ = reg.Register(spawnRecorder)
+	loop := &ReactLoop{Registry: reg, Config: Config{SystemPrompt: "sys"}}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.LastResponse = provider.Response{
+		ToolCalls: []provider.ToolCall{
+			{ID: "c1", Name: spawnSubagentToolName},
+			{ID: "c2", Name: "recorder"},
+		},
+	}
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	// Sequential dispatch: spawn first, then recorder.
+	want := []string{spawnSubagentToolName, "recorder"}
+	if !reflect.DeepEqual(dispatched, want) {
+		t.Errorf("dispatch order = %v, want %v (sequential fallback)", dispatched, want)
+	}
+}
+
+func TestExecuteSequentialPhase_SingleSpawnFallsBackToSequential(t *testing.T) {
+	// Single spawn — even though it's "all spawn," the predicate
+	// returns false so we skip the goroutine overhead.
+	calls := []provider.ToolCall{
+		{ID: "c1", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+	}
+	loop, pc, tt := newParallelTestRig(t, calls, 50*time.Millisecond)
+
+	_ = loop.executeSequentialPhase(context.Background(), pc)
+
+	if tt.maxInFlight != 1 {
+		t.Errorf("maxInFlight = %d, want 1 (single call, no parallel)", tt.maxInFlight)
+	}
+}
+
+func TestExecuteSequentialPhase_ParallelBatchCtxCancelReturnsErrInterrupted(t *testing.T) {
+	// Pre-cancelled ctx → the per-call ctx checks inside
+	// executeOneCall (via the hook fire path) trip first; even
+	// without hooks, the dispatcher's post-wg.Wait check catches
+	// it. Either way: ErrInterrupted.
+	calls := []provider.ToolCall{
+		{ID: "c1", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+		{ID: "c2", Name: spawnSubagentToolName, Arguments: json.RawMessage(`{}`)},
+	}
+	loop, pc, _ := newParallelTestRig(t, calls, 50*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	action := loop.executeSequentialPhase(ctx, pc)
+	if action.Kind != LoopActionReturn {
+		t.Fatalf("Kind = %s, want return", action.Kind)
+	}
+	if !errors.Is(action.Err, ErrInterrupted) {
+		t.Errorf("Err = %v, want chain containing ErrInterrupted", action.Err)
+	}
+}
+
+func TestExecuteSequentialPhase_ParallelBatchPropagatesInfrastructureError(t *testing.T) {
+	// Calls reference a non-existent tool — Registry.Dispatch
+	// returns "tool not found" error. The first failing goroutine's
+	// action wins; phase returns ErrToolExec.
+	reg := tools.NewRegistry() // empty — no spawn_subagent registered
+	loop := &ReactLoop{Registry: reg, Config: Config{SystemPrompt: "sys"}}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.LastResponse = provider.Response{
+		ToolCalls: []provider.ToolCall{
+			{ID: "c1", Name: spawnSubagentToolName},
+			{ID: "c2", Name: spawnSubagentToolName},
+		},
+	}
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionReturn {
+		t.Fatalf("Kind = %s, want return", action.Kind)
+	}
+	if !errors.Is(action.Err, ErrToolExec) {
+		t.Errorf("Err = %v, want chain containing ErrToolExec", action.Err)
 	}
 }
 

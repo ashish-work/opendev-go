@@ -3,6 +3,7 @@ package agents
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/ashish-work/opendev-go/internal/agents/doomloop"
 	"github.com/ashish-work/opendev-go/internal/hooks"
@@ -10,6 +11,25 @@ import (
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
+
+// spawnSubagentToolName is the canonical tool name spawn_subagent
+// registers as. Hardcoded here to avoid an import cycle with
+// internal/tools/spawn (which imports internal/agents).
+//
+// Must match internal/tools/spawn.ToolName — checked via the
+// homogeneous-batch detector below.
+const spawnSubagentToolName = "spawn_subagent"
+
+// MaxParallelSpawn caps the number of spawn_subagent calls that run
+// concurrently when the model emits a homogeneous batch. The phase
+// uses a buffered-channel semaphore of this size.
+//
+// Conservative against OpenAI Tier 1 TPM limits (4 × ~5K
+// TPM/subagent stays inside the 30K cap for gpt-4o). Higher-tier
+// users can edit this constant; a CLI flag is deferred until
+// there's demand. Hardcoded so a single shared value is used by
+// every binary; the tests verify the cap.
+const MaxParallelSpawn = 4
 
 // safetyPhase is the first phase of every iteration. It consolidates
 // the two preconditions that can short-circuit the loop without an
@@ -283,93 +303,250 @@ func (l *ReactLoop) processResponsePhase(_ context.Context, pc *PhaseContext) Lo
 // adds parallel dispatch for the homogeneous-spawn_subagent batch
 // case but leaves the sequential path here as the default.
 func (l *ReactLoop) executeSequentialPhase(ctx context.Context, pc *PhaseContext) LoopAction {
-	for _, call := range pc.LastResponse.ToolCalls {
-		args := ensureJSON(call.Arguments)
+	calls := pc.LastResponse.ToolCalls
 
-		// 1. PreToolUse — gate, transform, or annotate.
-		preResult, err := l.fireHook(ctx, hooks.HookEventPreToolUse, call.Name,
-			hooks.PreToolUsePayload{Tool: call.Name, Args: args})
-		if err != nil || ctx.Err() != nil {
-			// Either Manager.Fire returned ctx.Err() (it was
-			// already cancelled going in) or the ctx was cancelled
-			// while a per-hook command was running and the hook
-			// kill propagated as a per-hook infrastructure error.
-			// Either way the right semantic is "user wants out."
-			cause := err
-			if cause == nil {
-				cause = ctx.Err()
-			}
-			return NewLoopActionReturn(
-				Result{
-					Messages:    *pc.History,
-					Interrupted: true,
-					Budget:      pc.Snapshot(),
-				},
-				fmt.Errorf("%w: iter %d: %v", ErrInterrupted, pc.Iter, cause),
-				pc.Tracker,
-			)
+	// Parallel-spawn fast path: when the model emits a homogeneous
+	// batch of spawn_subagent calls, dispatch them concurrently.
+	// Other batch shapes (mixed, single call, non-spawn) fall
+	// through to the sequential loop below.
+	if isHomogeneousSpawnBatch(calls) {
+		return l.executeParallelSpawnBatch(ctx, pc)
+	}
+
+	for _, call := range calls {
+		outcome, action := l.executeOneCall(ctx, pc, call)
+		if action.Kind == LoopActionReturn {
+			return action
 		}
-		if preResult.IsDeny() {
-			pc.AppendMessage(ToolResultMessage(call.ID, call.Name, tools.ToolResult{
+		pc.AppendMessage(ToolResultMessage(outcome.Call.ID, outcome.Call.Name, outcome.Result))
+		appendHookContext(pc, outcome.PreContext)
+		appendHookContext(pc, outcome.PostContext)
+	}
+	return NewLoopActionContinue(pc.Tracker)
+}
+
+// oneCallOutcome packages everything one tool dispatch contributes
+// to history: the tool result itself (becomes a ToolResultMessage)
+// plus any AdditionalContext from PreToolUse / PostToolUse hooks
+// (each becomes a separate SystemMessage AFTER the tool result).
+//
+// Returned by executeOneCall and consumed by both the sequential
+// loop in executeSequentialPhase and the parallel dispatcher in
+// executeParallelSpawnBatch. Centralising the shape keeps the
+// hook-firing rules in one place.
+type oneCallOutcome struct {
+	// Call is the tool_call from the assistant message — needed
+	// to construct ToolResultMessage(ID, Name, Result).
+	Call provider.ToolCall
+
+	// Result is what Registry.Dispatch (or a synthetic block)
+	// produced.
+	Result tools.ToolResult
+
+	// PreContext is PreToolUse's AdditionalContext, appended as a
+	// SystemMessage AFTER the tool result.
+	PreContext string
+
+	// PostContext is PostToolUse's AdditionalContext, appended as
+	// a SystemMessage AFTER PreContext.
+	PostContext string
+}
+
+// executeOneCall runs the hook → dispatch → hook chain for one
+// tool call and returns either an outcome to append to history
+// (with a Continue LoopAction) or a Return LoopAction for an
+// infrastructure failure / ctx cancellation.
+//
+// Used by both the sequential loop and the parallel batch
+// dispatcher — extracting the per-call logic keeps the
+// hook-handling rules from drifting between the two paths.
+//
+// The function does NOT mutate pc.History; the caller is
+// responsible for appending. This is what makes parallel dispatch
+// safe: every goroutine produces an outcome locally, and the main
+// goroutine drains the outcomes after wg.Wait.
+func (l *ReactLoop) executeOneCall(ctx context.Context, pc *PhaseContext, call provider.ToolCall) (oneCallOutcome, LoopAction) {
+	args := ensureJSON(call.Arguments)
+
+	// 1. PreToolUse — gate, transform, or annotate.
+	preResult, err := l.fireHook(ctx, hooks.HookEventPreToolUse, call.Name,
+		hooks.PreToolUsePayload{Tool: call.Name, Args: args})
+	if err != nil || ctx.Err() != nil {
+		return oneCallOutcome{}, l.interruptedReturn(pc, hookCause(err, ctx))
+	}
+	if preResult.IsDeny() {
+		return oneCallOutcome{
+			Call: call,
+			Result: tools.ToolResult{
 				Output:  fmt.Sprintf("blocked by hook: %s", preResult.Reason),
 				Success: false,
 				Error:   "permission denied",
-			}))
-			appendHookContext(pc, preResult.AdditionalContext)
-			continue
-		}
-		if len(preResult.UpdatedInput) > 0 {
-			args = preResult.UpdatedInput
-		}
-
-		// 2. Dispatch.
-		result, dispatchErr := l.Registry.Dispatch(ctx, pc.ToolCtx, call.Name, args)
-		if dispatchErr != nil {
-			// 3a. PostToolUseFailure — fire but ignore the verdict
-			// since we're bailing anyway.
-			_, _ = l.fireHook(ctx, hooks.HookEventPostToolUseFailure, call.Name,
-				hooks.PostToolUseFailurePayload{
-					Tool:  call.Name,
-					Error: dispatchErr.Error(),
-				})
-			return NewLoopActionReturn(
-				Result{
-					Messages: *pc.History,
-					Budget:   pc.Snapshot(),
-				},
-				fmt.Errorf("%w: %s: %v", ErrToolExec, call.Name, dispatchErr),
-				pc.Tracker,
-			)
-		}
-
-		// 3b. PostToolUse — collect annotation for the model.
-		postResult, err := l.fireHook(ctx, hooks.HookEventPostToolUse, call.Name,
-			hooks.PostToolUsePayload{
-				Tool:    call.Name,
-				Output:  result.Output,
-				Success: result.Success,
-			})
-		if err != nil || ctx.Err() != nil {
-			cause := err
-			if cause == nil {
-				cause = ctx.Err()
-			}
-			return NewLoopActionReturn(
-				Result{
-					Messages:    *pc.History,
-					Interrupted: true,
-					Budget:      pc.Snapshot(),
-				},
-				fmt.Errorf("%w: iter %d: %v", ErrInterrupted, pc.Iter, cause),
-				pc.Tracker,
-			)
-		}
-
-		// 4. Append tool result, then drained AdditionalContext.
-		pc.AppendMessage(ToolResultMessage(call.ID, call.Name, result))
-		appendHookContext(pc, preResult.AdditionalContext)
-		appendHookContext(pc, postResult.AdditionalContext)
+			},
+			PreContext: preResult.AdditionalContext,
+		}, NewLoopActionContinue(pc.Tracker)
 	}
+	if len(preResult.UpdatedInput) > 0 {
+		args = preResult.UpdatedInput
+	}
+
+	// 2. Dispatch.
+	result, dispatchErr := l.Registry.Dispatch(ctx, pc.ToolCtx, call.Name, args)
+	if dispatchErr != nil {
+		// 3a. PostToolUseFailure — fire but ignore the verdict
+		// since we're bailing anyway.
+		_, _ = l.fireHook(ctx, hooks.HookEventPostToolUseFailure, call.Name,
+			hooks.PostToolUseFailurePayload{
+				Tool:  call.Name,
+				Error: dispatchErr.Error(),
+			})
+		return oneCallOutcome{}, NewLoopActionReturn(
+			Result{
+				Messages: *pc.History,
+				Budget:   pc.Snapshot(),
+			},
+			fmt.Errorf("%w: %s: %v", ErrToolExec, call.Name, dispatchErr),
+			pc.Tracker,
+		)
+	}
+
+	// 3b. PostToolUse — collect annotation for the model.
+	postResult, err := l.fireHook(ctx, hooks.HookEventPostToolUse, call.Name,
+		hooks.PostToolUsePayload{
+			Tool:    call.Name,
+			Output:  result.Output,
+			Success: result.Success,
+		})
+	if err != nil || ctx.Err() != nil {
+		return oneCallOutcome{}, l.interruptedReturn(pc, hookCause(err, ctx))
+	}
+
+	return oneCallOutcome{
+		Call:        call,
+		Result:      result,
+		PreContext:  preResult.AdditionalContext,
+		PostContext: postResult.AdditionalContext,
+	}, NewLoopActionContinue(pc.Tracker)
+}
+
+// interruptedReturn constructs the LoopActionReturn for the
+// "user cancelled mid-call" path. Centralised so the formatting
+// stays consistent.
+func (l *ReactLoop) interruptedReturn(pc *PhaseContext, cause error) LoopAction {
+	return NewLoopActionReturn(
+		Result{
+			Messages:    *pc.History,
+			Interrupted: true,
+			Budget:      pc.Snapshot(),
+		},
+		fmt.Errorf("%w: iter %d: %v", ErrInterrupted, pc.Iter, cause),
+		pc.Tracker,
+	)
+}
+
+// hookCause picks the right "why we're returning" cause for the
+// interrupted path: prefer the hook's error when present, else
+// fall back to ctx.Err() (the cancellation that propagated through
+// a per-hook process kill).
+func hookCause(hookErr error, ctx context.Context) error {
+	if hookErr != nil {
+		return hookErr
+	}
+	return ctx.Err()
+}
+
+// isHomogeneousSpawnBatch reports whether every tool call in the
+// batch is spawn_subagent AND there's more than one of them. Single
+// calls fall back to the sequential path because the goroutine +
+// waitgroup + semaphore overhead would dominate the win.
+//
+// "Homogeneous spawn" is the obvious safe parallel case:
+// spawn_subagent fires an isolated child loop with no shared
+// mutable state between calls. Other tools (edit_file, bash) have
+// ordering semantics that make parallel dispatch unsafe without
+// per-tool analysis.
+func isHomogeneousSpawnBatch(calls []provider.ToolCall) bool {
+	if len(calls) < 2 {
+		return false
+	}
+	for _, c := range calls {
+		if c.Name != spawnSubagentToolName {
+			return false
+		}
+	}
+	return true
+}
+
+// executeParallelSpawnBatch dispatches a homogeneous batch of
+// spawn_subagent calls concurrently. Each goroutine runs the same
+// executeOneCall as the sequential path; results are collected into
+// an indexed slice (declaration order) and appended to history
+// after wg.Wait returns.
+//
+// Concurrency is capped at MaxParallelSpawn via a buffered-channel
+// semaphore so a 10-call batch on a Tier 1 OpenAI key doesn't
+// instantly blow through the TPM cap.
+//
+// Failure handling: if any goroutine produces a Return action
+// (infrastructure error or interrupt), the dispatcher waits for
+// all in-flight goroutines to drain (so no leak) and returns the
+// first failing action. Successful outcomes from other goroutines
+// are discarded — mirrors the sequential path's "bail on first
+// error" behavior so the two paths are observationally
+// equivalent.
+//
+// Ctx cancellation mid-batch is caught both via the per-call
+// ctx checks inside executeOneCall AND via a final ctx.Err()
+// check after wg.Wait, surfacing as ErrInterrupted.
+func (l *ReactLoop) executeParallelSpawnBatch(ctx context.Context, pc *PhaseContext) LoopAction {
+	calls := pc.LastResponse.ToolCalls
+	outcomes := make([]oneCallOutcome, len(calls))
+	actions := make([]LoopAction, len(calls))
+
+	sem := make(chan struct{}, MaxParallelSpawn)
+	var wg sync.WaitGroup
+
+	for i, call := range calls {
+		wg.Add(1)
+		go func(idx int, c provider.ToolCall) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			outcome, action := l.executeOneCall(ctx, pc, c)
+			outcomes[idx] = outcome
+			actions[idx] = action
+		}(i, call)
+	}
+
+	wg.Wait()
+
+	// If ctx was cancelled mid-batch, return ErrInterrupted
+	// regardless of whether the goroutines noticed. Belt-and-
+	// braces: the per-call check inside executeOneCall already
+	// catches most cases.
+	if err := ctx.Err(); err != nil {
+		return l.interruptedReturn(pc, err)
+	}
+
+	// Walk in declaration order so the FIRST failure (by tool_call
+	// position) wins. Mirrors how the sequential path bails on the
+	// first error it encounters.
+	for _, action := range actions {
+		if action.Kind == LoopActionReturn {
+			return action
+		}
+	}
+
+	// All successful — append in declaration order. Each outcome's
+	// PreContext and PostContext become separate SystemMessages
+	// AFTER the corresponding tool result, just like the sequential
+	// path.
+	for _, outcome := range outcomes {
+		pc.AppendMessage(ToolResultMessage(outcome.Call.ID, outcome.Call.Name, outcome.Result))
+		appendHookContext(pc, outcome.PreContext)
+		appendHookContext(pc, outcome.PostContext)
+	}
+
 	return NewLoopActionContinue(pc.Tracker)
 }
 
