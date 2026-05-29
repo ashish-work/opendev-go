@@ -16,11 +16,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/ashish-work/opendev-go/internal/agents"
 	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider/router"
+	"github.com/ashish-work/opendev-go/internal/runtime/permissions"
 	"github.com/ashish-work/opendev-go/internal/session"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/tools/bash"
@@ -98,6 +100,19 @@ func main() {
 		hookManager = hooks.NewManager(hookSettings, hooks.NewExecutor(workingDir))
 	}
 
+	// Load permissions from the same settings.json files. Missing
+	// files / missing "permissions" key produce an allow-everything
+	// zero Policy.
+	permPolicy, err := permissions.Load(workingDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: load permissions: %v\n", err)
+		os.Exit(1)
+	}
+	if len(permPolicy.Tools) > 0 {
+		slog.Info("permissions: loaded policy",
+			"tool_entries", len(permPolicy.Tools))
+	}
+
 	// Construct session + fire SessionStart. Deny exits with the
 	// reason; allow's AdditionalContext appends to the system prompt.
 	sess := session.New(workingDir)
@@ -129,6 +144,7 @@ func main() {
 		MaxContextTokens: *maxContext,
 	})
 	loop.Hooks = hookManager
+	loop.Permissions = permPolicy
 
 	// Register spawn_subagent AFTER the other tools — it needs the
 	// shared registry, caller, and hook manager to construct child
@@ -136,12 +152,13 @@ func main() {
 	// a subagent sees the registry including spawn itself, so
 	// recursion (capped at DefaultMaxDepth) Just Works.
 	mustRegister(registry, spawn.New(spawn.Config{
-		Caller:     caller,
-		Registry:   registry,
-		Workflow:   workflow.Config{Execution: workflow.SlotConfig{Model: *model}},
-		WorkingDir: workingDir,
-		MaxCtx:     *maxContext,
-		Hooks:      hookManager,
+		Caller:      caller,
+		Registry:    registry,
+		Workflow:    workflow.Config{Execution: workflow.SlotConfig{Model: *model}},
+		WorkingDir:  workingDir,
+		MaxCtx:      *maxContext,
+		Hooks:       hookManager,
+		Permissions: permPolicy,
 	}))
 
 	runErr := tui.Run(loop, *model, sess, hookManager)

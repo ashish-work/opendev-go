@@ -8,6 +8,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/cost"
 	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/runtime/permissions"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
@@ -68,6 +69,18 @@ type ReactLoop struct {
 	// as it did before Phase 6 landed. Binary wiring (#35) sets
 	// this field when settings.json registers any hooks.
 	Hooks *hooks.Manager
+
+	// Permissions is the loaded runtime policy consulted before
+	// each tool dispatch. The zero value (no Tools entries) is a
+	// valid "allow everything" policy — Check returns Allow for
+	// every unknown tool name. That keeps loops constructed
+	// without an explicit policy (older tests, simple callers)
+	// behaving exactly as they did before Phase 8 landed.
+	//
+	// Value type, not pointer: forces every loop to have a policy
+	// (even if zero) so executeOneCall calls Check unconditionally.
+	// No nil-branching in the hot path.
+	Permissions permissions.Policy
 }
 
 // NewReactLoop wires the loop with defaults applied for zero fields in

@@ -16,6 +16,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/cost"
 	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/runtime/permissions"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
@@ -848,4 +849,103 @@ func (c *capturingTool) Schema() json.RawMessage {
 func (c *capturingTool) Execute(ctx context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
 	c.fn(ctx)
 	return tools.ToolResult{Output: "captured", Success: true}, nil
+}
+
+func TestBuildChildLoop_InheritsParentPermissions(t *testing.T) {
+	// Subagents must run under the same policy the parent runs
+	// under — a user's deny pattern applies uniformly across the
+	// whole call graph. buildChildLoop is the seam where the
+	// policy must flow from spawn.Config to the child *ReactLoop.
+	//
+	// We construct a Tool with a non-zero Policy, build a child
+	// loop, and assert the child carries the same Policy. No LLM
+	// call needed; this is a wiring assertion.
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"permissions":{"bash":{"deny_patterns":["rm -rf"]}}}`),
+		0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	parentPolicy, err := permissions.LoadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if len(parentPolicy.Tools) == 0 {
+		t.Fatal("parentPolicy is unexpectedly empty; test setup wrong")
+	}
+
+	caller := agents.NewLlmCaller(&stubProvider{}, cost.Pricing{
+		InputPricePerMillion:  1.0,
+		OutputPricePerMillion: 1.0,
+	})
+	registry := tools.NewRegistry()
+	tool := New(Config{
+		Caller:      caller,
+		Registry:    registry,
+		Workflow:    workflow.Config{Execution: workflow.SlotConfig{Model: "stub"}},
+		WorkingDir:  "/tmp",
+		MaxCtx:      128_000,
+		Permissions: parentPolicy,
+	})
+
+	childLoop := tool.buildChildLoop(subagents.SubAgentSpec{
+		Name:          "Explore",
+		SystemPrompt:  "explore",
+		MaxIterations: 5,
+	})
+
+	// The child must observe the same policy. We exercise it
+	// through the public Check method rather than comparing
+	// struct fields by value (regexp pointers won't match by
+	// reflect.DeepEqual after a load round-trip, but a Check
+	// call proves the deny pattern is live in the child).
+	deny := childLoop.Permissions.Check("bash",
+		`{"command":"rm -rf /tmp"}`)
+	if deny.Allowed {
+		t.Fatal("child loop should inherit parent's bash deny pattern, but Check returned Allow")
+	}
+	if !strings.Contains(deny.Reason, "rm -rf") {
+		t.Errorf("expected child's deny reason to quote 'rm -rf', got %q",
+			deny.Reason)
+	}
+
+	// And a non-matching call still passes through.
+	allow := childLoop.Permissions.Check("bash",
+		`{"command":"ls -la"}`)
+	if !allow.Allowed {
+		t.Errorf("non-matching bash call should Allow in child loop, got Deny(%q)",
+			allow.Reason)
+	}
+}
+
+func TestBuildChildLoop_ZeroPermissionsAllowsAllInChild(t *testing.T) {
+	// Regression: when the parent has no policy (zero value), the
+	// child must also have no policy. Confirms the field truly
+	// passes through rather than getting silently defaulted.
+	caller := agents.NewLlmCaller(&stubProvider{}, cost.Pricing{
+		InputPricePerMillion:  1.0,
+		OutputPricePerMillion: 1.0,
+	})
+	registry := tools.NewRegistry()
+	tool := New(Config{
+		Caller:     caller,
+		Registry:   registry,
+		Workflow:   workflow.Config{Execution: workflow.SlotConfig{Model: "stub"}},
+		WorkingDir: "/tmp",
+		MaxCtx:     128_000,
+		// Permissions intentionally omitted — zero value.
+	})
+
+	childLoop := tool.buildChildLoop(subagents.SubAgentSpec{
+		Name:          "Build",
+		SystemPrompt:  "build",
+		MaxIterations: 5,
+	})
+
+	if got := len(childLoop.Permissions.Tools); got != 0 {
+		t.Fatalf("childLoop.Permissions.Tools len = %d, want 0 (zero policy)", got)
+	}
+	if d := childLoop.Permissions.Check("bash", `{}`); !d.Allowed {
+		t.Errorf("zero Policy should Allow any tool, got Deny(%q)", d.Reason)
+	}
 }

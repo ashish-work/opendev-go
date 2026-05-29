@@ -18,6 +18,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/cost"
 	"github.com/ashish-work/opendev-go/internal/hooks"
 	"github.com/ashish-work/opendev-go/internal/provider"
+	"github.com/ashish-work/opendev-go/internal/runtime/permissions"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
@@ -1649,6 +1650,281 @@ func TestExecuteSequentialPhase_ParallelBatchPropagatesInfrastructureError(t *te
 	}
 	if !errors.Is(action.Err, ErrToolExec) {
 		t.Errorf("Err = %v, want chain containing ErrToolExec", action.Err)
+	}
+}
+
+// newPermissionsTestRig builds a *ReactLoop with the given tool and
+// permission policy, plus a pc primed to dispatch one tool_call.
+// Mirrors newHookExecuteTestRig's shape so permission tests look
+// like the hook tests next to them — same boilerplate, same
+// inspection points.
+func newPermissionsTestRig(
+	t *testing.T,
+	tool *fakeTool,
+	policy permissions.Policy,
+	args json.RawMessage,
+) (*ReactLoop, *PhaseContext) {
+	t.Helper()
+	reg := tools.NewRegistry()
+	if err := reg.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	loop := &ReactLoop{
+		Registry:    reg,
+		Config:      Config{SystemPrompt: "sys"},
+		Permissions: policy,
+	}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(
+		&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.Iter = 1
+	pc.LastResponse = provider.Response{
+		ToolCalls: []provider.ToolCall{{
+			ID:        "c1",
+			Name:      tool.name,
+			Arguments: args,
+		}},
+	}
+	return loop, pc
+}
+
+func TestExecuteSequentialPhase_PermissionsAllowDispatchesNormally(t *testing.T) {
+	// Policy with an Enabled=true bash entry and no deny patterns
+	// must let the dispatch run. This is the "user wrote
+	// {bash: {deny_patterns: []}}" case — the entry exists but
+	// allows everything.
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"permissions":{"foo":{"deny_patterns":["never-matches-zzz"]}}}`),
+		0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	policy, err := permissions.LoadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+	loop, pc := newPermissionsTestRig(t, tool, policy,
+		json.RawMessage(`{"command":"ls"}`))
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if tool.calls != 1 {
+		t.Errorf("tool.calls = %d, want 1 (allow should dispatch)", tool.calls)
+	}
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3 (tool result appended)", got)
+	}
+	last := (*pc.History)[2]
+	if !strings.Contains(last.Content[0].Text, "ok") {
+		t.Errorf("tool output should be appended; got %q", last.Content[0].Text)
+	}
+}
+
+func TestExecuteSequentialPhase_PermissionsDenyMatchedPattern(t *testing.T) {
+	// Policy denies bash via a deny pattern that matches the args
+	// JSON. The tool must NOT execute, the synthetic tool result
+	// must mention the matched pattern, and the LoopAction must be
+	// Continue so the model gets a chance to pivot.
+	//
+	// Constructed through LoadFile so the source-string parallel
+	// slice (used in the deny reason) is populated by the real
+	// path of record.
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"permissions":{"foo":{"deny_patterns":["rm -rf"]}}}`),
+		0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	policy, err := permissions.LoadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			t.Errorf("tool.Execute should NOT have been called on permission deny")
+			return tools.ToolResult{}, nil
+		},
+	}
+	loop, pc := newPermissionsTestRig(t, tool, policy,
+		json.RawMessage(`{"command":"rm -rf /tmp"}`))
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue (deny is observation, not error)", action.Kind)
+	}
+	if tool.calls != 0 {
+		t.Errorf("tool.calls = %d, want 0 (deny should skip dispatch)", tool.calls)
+	}
+	if got := len(*pc.History); got != 3 {
+		t.Fatalf("history len = %d, want 3 (synthetic blocked result appended)", got)
+	}
+	last := (*pc.History)[2]
+	if last.Role != "tool" {
+		t.Errorf("appended role = %q, want tool", last.Role)
+	}
+	if last.ToolCallID != "c1" {
+		t.Errorf("ToolCallID = %q, want c1 (pairing preserved)", last.ToolCallID)
+	}
+	text := last.Content[0].Text
+	if !strings.Contains(text, "denied by policy") {
+		t.Errorf("output should mention 'denied by policy'; got %q", text)
+	}
+	if !strings.Contains(text, "rm -rf") {
+		t.Errorf("output should quote the matched pattern; got %q", text)
+	}
+}
+
+func TestExecuteSequentialPhase_PermissionsDenyDisabledTool(t *testing.T) {
+	// Policy explicitly disables the tool (Enabled=false). Same
+	// short-circuit, different reason — the deny message should
+	// say "disabled by policy", not "matches deny pattern".
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"permissions":{"foo":{"enabled":false}}}`),
+		0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	policy, err := permissions.LoadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			t.Errorf("disabled tool must not execute")
+			return tools.ToolResult{}, nil
+		},
+	}
+	loop, pc := newPermissionsTestRig(t, tool, policy,
+		json.RawMessage(`{"any":"args"}`))
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if tool.calls != 0 {
+		t.Errorf("tool.calls = %d, want 0", tool.calls)
+	}
+	text := (*pc.History)[2].Content[0].Text
+	if !strings.Contains(text, "disabled by policy") {
+		t.Errorf("output should mention 'disabled by policy'; got %q", text)
+	}
+}
+
+func TestExecuteSequentialPhase_PermissionsZeroPolicyAllowsEverything(t *testing.T) {
+	// Regression guarantee for callers (older tests, simple
+	// binaries) that don't set Permissions at all. The zero
+	// permissions.Policy must let every tool through, preserving
+	// v1 behavior end-to-end.
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, _ json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+	loop, pc := newPermissionsTestRig(t, tool, permissions.Policy{},
+		json.RawMessage(`{"command":"rm -rf /"}`))
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if tool.calls != 1 {
+		t.Errorf("tool.calls = %d, want 1 (zero Policy must allow)", tool.calls)
+	}
+}
+
+func TestExecuteSequentialPhase_HookSanitizesBeforePermissionsCheck(t *testing.T) {
+	// Critical ordering test: PreToolUse runs BEFORE permissions
+	// check, so a hook that rewrites args (via UpdatedInput) lets
+	// the user build a sanitize-then-check workflow. Concrete
+	// proof of the design choice documented in executeOneCall.
+	//
+	// Setup: original args mention "forbidden"; hook strips them
+	// via UpdatedInput; policy denies args containing "forbidden".
+	// Result: dispatch runs because permissions checks the sanitized
+	// args, not the original.
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"permissions":{"foo":{"deny_patterns":["forbidden"]}}}`),
+		0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	policy, err := permissions.LoadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+
+	var receivedArgs json.RawMessage
+	tool := &fakeTool{
+		name:   "foo",
+		schema: json.RawMessage(`{"type":"object"}`),
+		exec: func(_ context.Context, _ tools.ToolContext, args json.RawMessage) (tools.ToolResult, error) {
+			receivedArgs = args
+			return tools.ToolResult{Output: "ok", Success: true}, nil
+		},
+	}
+
+	// Hook rewrites args to remove the forbidden token.
+	matcher := makeHookMatcher(t, "",
+		`echo '{"updatedInput":{"clean":true}}'`)
+	settings := hooks.HookSettings{
+		Hooks: map[hooks.HookEvent][]hooks.HookMatcher{
+			hooks.HookEventPreToolUse: {matcher},
+		},
+	}
+	reg := tools.NewRegistry()
+	if err := reg.Register(tool); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	loop := &ReactLoop{
+		Registry:    reg,
+		Config:      Config{SystemPrompt: "sys"},
+		Hooks:       hooks.NewManager(settings, hooks.NewExecutor("")),
+		Permissions: policy,
+	}
+	history := []provider.Message{SystemMessage("sys"), UserMessage("hi")}
+	pc := NewPhaseContext(
+		&history, cost.Tracker{}, budget.New(0), doomloop.New(),
+		tools.ToolContext{}, nil, "sys")
+	pc.Iter = 1
+	pc.LastResponse = provider.Response{
+		ToolCalls: []provider.ToolCall{{
+			ID:        "c1",
+			Name:      "foo",
+			Arguments: json.RawMessage(`{"command":"forbidden thing"}`),
+		}},
+	}
+
+	action := loop.executeSequentialPhase(context.Background(), pc)
+	if action.Kind != LoopActionContinue {
+		t.Fatalf("Kind = %s, want continue", action.Kind)
+	}
+	if tool.calls != 1 {
+		t.Errorf("tool.calls = %d, want 1 (hook sanitized away the deny)", tool.calls)
+	}
+	if !strings.Contains(string(receivedArgs), "clean") {
+		t.Errorf("expected hook-rewritten args at tool, got %q", receivedArgs)
+	}
+	if strings.Contains(string(receivedArgs), "forbidden") {
+		t.Errorf("forbidden token leaked through to tool: %q", receivedArgs)
 	}
 }
 

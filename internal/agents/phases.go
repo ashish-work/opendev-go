@@ -352,10 +352,10 @@ type oneCallOutcome struct {
 	PostContext string
 }
 
-// executeOneCall runs the hook → dispatch → hook chain for one
-// tool call and returns either an outcome to append to history
-// (with a Continue LoopAction) or a Return LoopAction for an
-// infrastructure failure / ctx cancellation.
+// executeOneCall runs the hook → permissions → dispatch → hook
+// chain for one tool call and returns either an outcome to append
+// to history (with a Continue LoopAction) or a Return LoopAction
+// for an infrastructure failure / ctx cancellation.
 //
 // Used by both the sequential loop and the parallel batch
 // dispatcher — extracting the per-call logic keeps the
@@ -389,10 +389,31 @@ func (l *ReactLoop) executeOneCall(ctx context.Context, pc *PhaseContext, call p
 		args = preResult.UpdatedInput
 	}
 
-	// 2. Dispatch.
+	// 2. Permissions check — consulted AFTER PreToolUse so a hook
+	//    that rewrites args (sanitize, normalize, strip a forbidden
+	//    prefix) gets to clean the input before the policy
+	//    evaluates it. The deny path mirrors the hook-deny shape:
+	//    Success:false, Error:"permission denied", and a Continue
+	//    LoopAction so the model sees the rejection in its tool
+	//    response and can pivot. This is not a hard stop; the
+	//    agent learns from the deny just like it learns from any
+	//    other tool failure.
+	if decision := l.Permissions.Check(call.Name, string(args)); !decision.Allowed {
+		return oneCallOutcome{
+			Call: call,
+			Result: tools.ToolResult{
+				Output:  fmt.Sprintf("denied by policy: %s", decision.Reason),
+				Success: false,
+				Error:   "permission denied",
+			},
+			PreContext: preResult.AdditionalContext,
+		}, NewLoopActionContinue(pc.Tracker)
+	}
+
+	// 4. Dispatch.
 	result, dispatchErr := l.Registry.Dispatch(ctx, pc.ToolCtx, call.Name, args)
 	if dispatchErr != nil {
-		// 3a. PostToolUseFailure — fire but ignore the verdict
+		// 4a. PostToolUseFailure — fire but ignore the verdict
 		// since we're bailing anyway.
 		_, _ = l.fireHook(ctx, hooks.HookEventPostToolUseFailure, call.Name,
 			hooks.PostToolUseFailurePayload{
@@ -409,7 +430,7 @@ func (l *ReactLoop) executeOneCall(ctx context.Context, pc *PhaseContext, call p
 		)
 	}
 
-	// 3b. PostToolUse — collect annotation for the model.
+	// 4b. PostToolUse — collect annotation for the model.
 	postResult, err := l.fireHook(ctx, hooks.HookEventPostToolUse, call.Name,
 		hooks.PostToolUsePayload{
 			Tool:    call.Name,

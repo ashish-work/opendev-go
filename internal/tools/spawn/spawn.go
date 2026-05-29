@@ -25,6 +25,7 @@ import (
 	"github.com/ashish-work/opendev-go/internal/agents"
 	"github.com/ashish-work/opendev-go/internal/agents/subagents"
 	"github.com/ashish-work/opendev-go/internal/hooks"
+	"github.com/ashish-work/opendev-go/internal/runtime/permissions"
 	"github.com/ashish-work/opendev-go/internal/tools"
 	"github.com/ashish-work/opendev-go/internal/workflow"
 )
@@ -78,6 +79,16 @@ type Config struct {
 	// Hooks is the optional lifecycle hook manager. Shared with the
 	// parent. SubagentStart / SubagentStop wiring lands in #41.
 	Hooks *hooks.Manager
+
+	// Permissions is the runtime policy the parent loop enforces.
+	// Subagents inherit it verbatim so a user's deny pattern
+	// applies uniformly across the whole call graph — no way for
+	// a sub-loop to escape rules the user set. Zero value is the
+	// allow-everything default, same as the parent loop.
+	//
+	// v3 may layer per-spec overrides on top; today there's one
+	// policy for the whole agent tree.
+	Permissions permissions.Policy
 
 	// MaxDepth overrides DefaultMaxDepth. Zero falls back to the
 	// constant. Exposed so binaries (or tests) can tighten the cap
@@ -357,6 +368,7 @@ func (t *Tool) buildChildLoop(spec subagents.SubAgentSpec) *agents.ReactLoop {
 		MaxContextTokens: t.cfg.MaxCtx,
 	})
 	loop.Hooks = t.cfg.Hooks
+	loop.Permissions = t.cfg.Permissions
 	return loop
 }
 
