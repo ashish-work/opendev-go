@@ -91,6 +91,40 @@ const (
 	ContentImage
 )
 
+// ReasoningEffort is a normalized hint to the provider about how
+// much "private thinking" budget to allocate per call. Adapters
+// translate this into vendor-specific knobs:
+//
+//   - OpenAI o1/o3/o4/gpt-5 family → "reasoning_effort": "<level>"
+//   - Anthropic Claude 3.7 / Opus 4.0–4.5 / Sonnet 4.0–4.5 / Haiku 4.5
+//     → "thinking": {"type":"enabled","budget_tokens":N}
+//     with N=4096 (Low), 16384 (Medium), 31999 (High)
+//   - Anthropic Claude 4.6+ → "thinking": {"type":"adaptive"}
+//     for any non-None level — the model self-regulates the budget
+//   - Non-supporting models silently omit the directive
+//
+// A named type rather than a plain string so callers get
+// autocomplete for the five valid values and the compiler catches
+// typos like ReasoningEffort("hihg").
+type ReasoningEffort string
+
+// ReasoningEffort constants. Unset and None are distinct on
+// purpose:
+//
+//   - Unset = "the caller did not configure this; let the provider's
+//     own default apply" — the adapter omits the field entirely.
+//   - None  = "I explicitly want reasoning off, even on a model
+//     that defaults to reasoning" — Anthropic emits
+//     {"type":"disabled"}; OpenAI silently omits because the
+//     o-family has no off switch.
+const (
+	ReasoningEffortUnset  ReasoningEffort = ""
+	ReasoningEffortNone   ReasoningEffort = "none"
+	ReasoningEffortLow    ReasoningEffort = "low"
+	ReasoningEffortMedium ReasoningEffort = "medium"
+	ReasoningEffortHigh   ReasoningEffort = "high"
+)
+
 // Request is the normalized LLM call payload. Adapters convert this into
 // vendor-specific JSON. Mirrors the OpenAI Chat Completions schema
 // because that's the lingua franca of LLM APIs.
@@ -105,6 +139,13 @@ type Request struct {
 	// Tools is the set of tools the model is allowed to call this turn.
 	// Empty means "no tool use, just respond".
 	Tools []ToolSchema
+
+	// ReasoningEffort is the private-thinking-budget hint. The zero
+	// value (ReasoningEffortUnset) makes every adapter skip the
+	// directive, preserving v1 behavior for callers that don't
+	// configure it. See ReasoningEffort docs for the five-value
+	// semantics.
+	ReasoningEffort ReasoningEffort
 }
 
 // Message is one turn in the conversation. Role + content is the core;

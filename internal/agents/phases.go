@@ -121,10 +121,12 @@ func (l *ReactLoop) safetyPhase(ctx context.Context, pc *PhaseContext) LoopActio
 func (l *ReactLoop) llmCallPhase(ctx context.Context, pc *PhaseContext) LoopAction {
 	msgCountAtRequest := len(*pc.History)
 
+	exec := l.Config.Workflow.Resolve(workflow.SlotExecution)
 	req := provider.Request{
-		Model:    l.Config.Workflow.Resolve(workflow.SlotExecution).Model,
-		Messages: *pc.History,
-		Tools:    SchemasFor(l.Registry),
+		Model:           exec.Model,
+		Messages:        *pc.History,
+		Tools:           SchemasFor(l.Registry),
+		ReasoningEffort: exec.ReasoningEffort,
 	}
 
 	var (

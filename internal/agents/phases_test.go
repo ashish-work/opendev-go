@@ -371,6 +371,48 @@ func TestLLMCallPhase_RequestShapeUsesWorkflowModelAndHistory(t *testing.T) {
 	}
 }
 
+func TestLLMCallPhase_PropagatesReasoningEffortFromSlot(t *testing.T) {
+	// The phase reads SlotExecution's ReasoningEffort and stamps
+	// it on the Request. End-to-end wiring check: configure the
+	// slot, run one call, inspect the provider.Request the fake
+	// provider captured.
+	p := &fakeProvider{responses: []provider.Response{{Content: "ok"}}}
+	loop := NewReactLoop(NewLlmCaller(p, cost.Pricing{}), tools.NewRegistry(), Config{
+		Workflow: workflow.Config{
+			Execution: workflow.SlotConfig{
+				Model:           "fake-model",
+				ReasoningEffort: provider.ReasoningEffortHigh,
+			},
+		},
+		MaxIterations: 25,
+		SystemPrompt:  "system prompt",
+	})
+	history := []provider.Message{
+		SystemMessage("system prompt"),
+		UserMessage("hello"),
+	}
+	pc := NewPhaseContext(
+		&history,
+		cost.Tracker{},
+		budget.New(128_000),
+		doomloop.New(),
+		tools.ToolContext{},
+		nil,
+		"system prompt",
+	)
+	pc.Iter = 1
+
+	_ = loop.llmCallPhase(context.Background(), pc)
+
+	if len(p.requests) != 1 {
+		t.Fatalf("requests captured = %d, want 1", len(p.requests))
+	}
+	if got := p.requests[0].ReasoningEffort; got != provider.ReasoningEffortHigh {
+		t.Errorf("Request.ReasoningEffort = %q, want %q",
+			got, provider.ReasoningEffortHigh)
+	}
+}
+
 func TestLLMCallPhase_CalibratorUsesMsgCountAtRequest(t *testing.T) {
 	// Calibrator's Update receives len(history) at request time —
 	// before any assistant append. With history = [system, user],

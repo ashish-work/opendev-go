@@ -16,6 +16,8 @@
 // config-shape migration.
 package workflow
 
+import "github.com/ashish-work/opendev-go/internal/provider"
+
 // Slot identifies one of the five model roles the agent can dispatch
 // against. Use the constants below — never construct Slot values from
 // arbitrary ints.
@@ -67,14 +69,21 @@ func (s Slot) String() string {
 	}
 }
 
-// SlotConfig holds the per-slot knobs. v1 carries only Model; future
-// fields (BaseURL, Temperature, MaxTokens) are intentionally deferred
-// until a concrete task needs them — adding a field is a one-line
-// change that does not break existing zero-value Configs.
+// SlotConfig holds the per-slot knobs. Adding a field is a
+// one-line change that does not break existing zero-value Configs;
+// Resolve handles fall-back-to-Execution for any new field.
 type SlotConfig struct {
 	// Model is the provider-specific identifier (e.g. "gpt-4o-mini").
 	// Empty means "fall back to Execution.Model" per Config.Resolve.
 	Model string
+
+	// ReasoningEffort is the private-thinking-budget hint passed
+	// through to the provider adapter. ReasoningEffortUnset means
+	// "fall back to Execution.ReasoningEffort" per Config.Resolve.
+	// ReasoningEffortNone is distinct from Unset — it explicitly
+	// asks the model not to think on this slot's calls even when
+	// Execution would have asked for reasoning.
+	ReasoningEffort provider.ReasoningEffort
 }
 
 // Config bundles all five slots. The zero value is usable but useless —
@@ -121,6 +130,9 @@ func (c Config) Resolve(slot Slot) SlotConfig {
 	}
 	if s.Model == "" {
 		s.Model = c.Execution.Model
+	}
+	if s.ReasoningEffort == provider.ReasoningEffortUnset {
+		s.ReasoningEffort = c.Execution.ReasoningEffort
 	}
 	return s
 }

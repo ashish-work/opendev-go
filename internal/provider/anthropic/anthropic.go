@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 
 	"github.com/ashish-work/opendev-go/internal/provider"
 )
@@ -44,6 +45,24 @@ const DefaultAPIVersion = "2023-06-01"
 // server-side. 4096 fits typical agent turns; bump via the adapter if
 // a workload truncates.
 const DefaultMaxTokens = 4096
+
+// Thinking budget constants for fixed-mode models (Claude 3.7 /
+// Opus 4.0–4.5 / Sonnet 4.0–4.5 / Haiku 4.5). Values come from
+// production-tuned defaults used in published agent loops, not
+// theoretical sweet spots:
+//
+//   - 4096  = smallest budget that produces usefully different
+//             output than no thinking at all.
+//   - 16384 = strong reasoning headroom for non-trivial tasks.
+//   - 31999 = one below Anthropic's 32K hard cap; the real "high".
+//
+// Claude 4.6+ models use adaptive thinking instead (the model
+// self-regulates its own budget) — see adaptiveThinkingPattern.
+const (
+	thinkingBudgetLow    = 4096
+	thinkingBudgetMedium = 16384
+	thinkingBudgetHigh   = 31999
+)
 
 // Adapter holds the configurable wire-level state for an Anthropic
 // provider. Stateless except for BaseURL — safe to share across
@@ -136,6 +155,17 @@ func (a Adapter) buildPayload(req provider.Request, stream bool) map[string]any 
 		maxTokens = DefaultMaxTokens
 	}
 
+	// Resolve thinking block first so we can bump max_tokens if a
+	// fixed budget is going to land in the payload — Anthropic
+	// rejects requests where max_tokens <= budget_tokens.
+	thinking, budgetTokens := thinkingBlock(req.Model, req.ReasoningEffort)
+	if budgetTokens > 0 {
+		needed := budgetTokens + DefaultMaxTokens
+		if maxTokens < needed {
+			maxTokens = needed
+		}
+	}
+
 	payload := map[string]any{
 		"model":      req.Model,
 		"max_tokens": maxTokens,
@@ -160,11 +190,96 @@ func (a Adapter) buildPayload(req provider.Request, stream bool) map[string]any 
 		payload["tools"] = convertTools(req.Tools)
 	}
 
+	if thinking != nil {
+		payload["thinking"] = thinking
+	}
+
 	if stream {
 		payload["stream"] = true
 	}
 
 	return payload
+}
+
+// fixedThinkingPattern matches Claude families that take a fixed
+// budget_tokens value on the thinking block — Claude 3.7, Opus
+// 4.0–4.5, Sonnet 4.0–4.5, Haiku 4.5. Adding a new fixed-budget
+// model is a one-line append here.
+var fixedThinkingPattern = regexp.MustCompile(
+	`^(claude-3-7|claude-opus-4-[0-5]|claude-sonnet-4-[0-5]|claude-haiku-4-5)`,
+)
+
+// adaptiveThinkingPattern matches Claude families that support the
+// adaptive thinking mode — Claude 4.6+ (Opus, Sonnet, Haiku) and
+// future Claude 5 lines. Adaptive mode lets the model self-regulate
+// its budget per call, which beats a fixed setting for capable
+// models. Pattern is checked BEFORE fixedThinkingPattern so a model
+// matched by both falls into the adaptive path.
+var adaptiveThinkingPattern = regexp.MustCompile(
+	`^(claude-opus-4-[6-9]|claude-sonnet-4-[6-9]|claude-haiku-4-[6-9]|claude-(opus|sonnet|haiku)-[5-9])`,
+)
+
+// thinkingBlock returns the value to set on payload["thinking"]
+// (or nil to omit) along with the fixed budget token count when
+// one was chosen (0 for adaptive, disabled, or omitted). The
+// budget is returned separately so buildPayload can bump
+// max_tokens above it without re-parsing the map.
+//
+// Branches:
+//
+//  1. ReasoningEffortUnset → nil, 0. The caller didn't ask for
+//     thinking; let the model's defaults apply.
+//  2. ReasoningEffortNone → {"type":"disabled"} on supporting
+//     models, nil otherwise. Explicit suppression for callers
+//     who measured that thinking hurts on a specific workload.
+//  3. Low/Medium/High on an adaptive model → {"type":"adaptive"}.
+//     The model picks its own budget. Operator's level is honored
+//     by the model rather than by a hardcoded budget here.
+//  4. Low/Medium/High on a fixed-budget model →
+//     {"type":"enabled","budget_tokens":N} with N from the
+//     thinkingBudget* constants.
+//  5. Any non-supporting model → nil. Silent omit; no error.
+func thinkingBlock(model string, effort provider.ReasoningEffort) (map[string]any, int) {
+	if effort == provider.ReasoningEffortUnset {
+		return nil, 0
+	}
+
+	adaptive := adaptiveThinkingPattern.MatchString(model)
+	fixed := fixedThinkingPattern.MatchString(model)
+	if !adaptive && !fixed {
+		// Not a thinking-capable model — silently omit even when
+		// the caller asked for None. There's nothing to suppress
+		// because nothing was going to happen anyway.
+		return nil, 0
+	}
+
+	if effort == provider.ReasoningEffortNone {
+		return map[string]any{"type": "disabled"}, 0
+	}
+
+	if adaptive {
+		// 4.6+ models self-regulate. We don't translate the
+		// operator's level into a budget here — that's the
+		// model's job.
+		return map[string]any{"type": "adaptive"}, 0
+	}
+
+	// Fixed-budget path. Unknown future ReasoningEffort values
+	// fall through to medium so the call still works rather than
+	// silently dropping the thinking directive.
+	budget := thinkingBudgetMedium
+	switch effort {
+	case provider.ReasoningEffortLow:
+		budget = thinkingBudgetLow
+	case provider.ReasoningEffortMedium:
+		budget = thinkingBudgetMedium
+	case provider.ReasoningEffortHigh:
+		budget = thinkingBudgetHigh
+	}
+	return map[string]any{
+		"type":          "enabled",
+		"budget_tokens": budget,
+	}, budget
 }
 
 // extractSystem walks the messages, returning the joined system-prompt

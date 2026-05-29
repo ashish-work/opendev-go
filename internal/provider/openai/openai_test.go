@@ -547,3 +547,94 @@ func TestChatCompletionsURL(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildPayload_ReasoningEffort(t *testing.T) {
+	// Table cases prove the four key behaviors in one place:
+	// unset omits (backwards compat), level lands on supporting
+	// model, level dropped on non-supporting model, None omits.
+	cases := []struct {
+		name      string
+		model     string
+		effort    provider.ReasoningEffort
+		wantField bool
+		wantValue string
+	}{
+		{
+			name:      "unset omits even on supporting model",
+			model:     "o3-mini",
+			effort:    provider.ReasoningEffortUnset,
+			wantField: false,
+		},
+		{
+			name:      "high on o3 model emits high",
+			model:     "o3-mini",
+			effort:    provider.ReasoningEffortHigh,
+			wantField: true,
+			wantValue: "high",
+		},
+		{
+			name:      "medium on o1 model emits medium",
+			model:     "o1-preview",
+			effort:    provider.ReasoningEffortMedium,
+			wantField: true,
+			wantValue: "medium",
+		},
+		{
+			name:      "low on gpt-5 model emits low",
+			model:     "gpt-5-mini",
+			effort:    provider.ReasoningEffortLow,
+			wantField: true,
+			wantValue: "low",
+		},
+		{
+			name:      "high on gpt-4o silently drops",
+			model:     "gpt-4o-mini",
+			effort:    provider.ReasoningEffortHigh,
+			wantField: false,
+		},
+		{
+			name:      "none on supporting model silently drops",
+			model:     "o3-mini",
+			effort:    provider.ReasoningEffortNone,
+			wantField: false,
+		},
+	}
+
+	a := Adapter{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := a.BuildRequest(provider.Request{
+				Model:           tc.model,
+				Messages:        []provider.Message{{Role: "user", Content: []provider.ContentBlock{{Kind: provider.ContentText, Text: "hi"}}}},
+				ReasoningEffort: tc.effort,
+			})
+			if err != nil {
+				t.Fatalf("BuildRequest: %v", err)
+			}
+			payload := unmarshalJSON(t, body)
+			got, present := payload["reasoning_effort"]
+			if tc.wantField {
+				if !present {
+					t.Fatalf("reasoning_effort missing; want %q", tc.wantValue)
+				}
+				if got != tc.wantValue {
+					t.Errorf("reasoning_effort = %v, want %q", got, tc.wantValue)
+				}
+			} else {
+				if present {
+					t.Errorf("reasoning_effort present unexpectedly: %v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenAIReasoningEffort_DefaultsToOmitOnUnknownLevel(t *testing.T) {
+	// Defensive: if a future ReasoningEffort value lands without a
+	// new switch arm, the helper must omit rather than send a
+	// possibly-invalid value that would 400 the request.
+	got := openAIReasoningEffort("o3-mini", provider.ReasoningEffort("future-level"))
+	if got != "" {
+		t.Errorf("unknown effort should omit; got %q", got)
+	}
+}

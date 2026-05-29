@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 
 	"github.com/ashish-work/opendev-go/internal/provider"
 )
@@ -82,6 +83,9 @@ func buildPayload(req provider.Request, stream bool) map[string]any {
 	if len(req.Tools) > 0 {
 		payload["tools"] = convertTools(req.Tools)
 	}
+	if effort := openAIReasoningEffort(req.Model, req.ReasoningEffort); effort != "" {
+		payload["reasoning_effort"] = effort
+	}
 	if stream {
 		payload["stream"] = true
 		// include_usage asks the server for a final chunk containing
@@ -90,6 +94,47 @@ func buildPayload(req provider.Request, stream bool) map[string]any {
 		payload["stream_options"] = map[string]any{"include_usage": true}
 	}
 	return payload
+}
+
+// reasoningEffortModelPattern matches the OpenAI families that
+// support the reasoning_effort knob: the o-series (o1, o3, o4) and
+// GPT-5. Anchored at the start so substring matches like
+// "chatgpt-4-o1-tuned" don't trigger. Updating the pattern when
+// OpenAI ships a new reasoning family is the path of record;
+// OpenAI does not expose a capability-query endpoint we could call.
+var reasoningEffortModelPattern = regexp.MustCompile(
+	`^(o1|o3|o4|gpt-5)`,
+)
+
+// openAIReasoningEffort returns the level string to emit in the
+// payload, or "" to omit the field. Rules:
+//
+//   - Unset            → "" (caller didn't configure it)
+//   - None             → "" (OpenAI has no "disable" — silently omit)
+//   - Low/Medium/High  → the level string, only on supporting models
+//   - Non-supporting model → "" regardless of level
+//
+// Split out so tests can exercise the mapping without round-
+// tripping a whole payload.
+func openAIReasoningEffort(model string, effort provider.ReasoningEffort) string {
+	if effort == provider.ReasoningEffortUnset || effort == provider.ReasoningEffortNone {
+		return ""
+	}
+	if !reasoningEffortModelPattern.MatchString(model) {
+		return ""
+	}
+	switch effort {
+	case provider.ReasoningEffortLow:
+		return "low"
+	case provider.ReasoningEffortMedium:
+		return "medium"
+	case provider.ReasoningEffortHigh:
+		return "high"
+	default:
+		// Unknown future value — be conservative and omit rather
+		// than send a value the API will reject.
+		return ""
+	}
 }
 
 // convertMessages translates normalized Messages into the OpenAI Chat

@@ -474,3 +474,193 @@ func TestBuildRequest_MultipleSystemMessagesJoinWithDoubleNewline(t *testing.T) 
 		t.Errorf("joined system text = %v", sys[0].(map[string]any)["text"])
 	}
 }
+
+func TestBuildPayload_Thinking_UnsetOmits(t *testing.T) {
+	// Backwards compat: a Request with no ReasoningEffort must
+	// produce a payload without a "thinking" key, so existing
+	// callers (everyone before #44) stay unaffected.
+	a := New()
+	body, err := a.BuildRequest(provider.Request{
+		Model:    "claude-opus-4-7",
+		Messages: []provider.Message{userText("hi")},
+	})
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	payload := unmarshalRequest(t, body)
+	if _, ok := payload["thinking"]; ok {
+		t.Errorf("payload has 'thinking' key on Unset request: %v", payload["thinking"])
+	}
+}
+
+func TestBuildPayload_Thinking_AdaptiveOnClaude47(t *testing.T) {
+	// Claude 4.6+ uses adaptive thinking — the model self-regulates
+	// the budget. The payload must NOT contain a fixed
+	// budget_tokens for 4.7 even when the operator asks for High.
+	a := New()
+	body, err := a.BuildRequest(provider.Request{
+		Model:           "claude-opus-4-7",
+		Messages:        []provider.Message{userText("hi")},
+		ReasoningEffort: provider.ReasoningEffortHigh,
+	})
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	payload := unmarshalRequest(t, body)
+	thinking, ok := payload["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected 'thinking' object; got %T (%v)", payload["thinking"], payload["thinking"])
+	}
+	if thinking["type"] != "adaptive" {
+		t.Errorf("type = %v, want adaptive (4.7 is a 4.6+ model)", thinking["type"])
+	}
+	if _, has := thinking["budget_tokens"]; has {
+		t.Errorf("adaptive thinking should NOT carry budget_tokens; got %v",
+			thinking["budget_tokens"])
+	}
+}
+
+func TestBuildPayload_Thinking_FixedBudgetsByEffort(t *testing.T) {
+	// Claude 3.7 / Opus 4.0-4.5 / Sonnet 4.0-4.5 / Haiku 4.5 use
+	// fixed budget_tokens. Verifying each level lands on the
+	// reference-tuned constants ensures we didn't drift back to
+	// the 1024/4096/16384 numbers the original brief had.
+	cases := []struct {
+		effort     provider.ReasoningEffort
+		wantBudget float64
+	}{
+		{provider.ReasoningEffortLow, float64(thinkingBudgetLow)},
+		{provider.ReasoningEffortMedium, float64(thinkingBudgetMedium)},
+		{provider.ReasoningEffortHigh, float64(thinkingBudgetHigh)},
+	}
+	a := New()
+	for _, tc := range cases {
+		t.Run(string(tc.effort), func(t *testing.T) {
+			body, err := a.BuildRequest(provider.Request{
+				Model:           "claude-opus-4-5",
+				Messages:        []provider.Message{userText("hi")},
+				ReasoningEffort: tc.effort,
+			})
+			if err != nil {
+				t.Fatalf("BuildRequest: %v", err)
+			}
+			payload := unmarshalRequest(t, body)
+			thinking, ok := payload["thinking"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected 'thinking' object")
+			}
+			if thinking["type"] != "enabled" {
+				t.Errorf("type = %v, want 'enabled' on fixed-budget model", thinking["type"])
+			}
+			got, ok := thinking["budget_tokens"].(float64)
+			if !ok {
+				t.Fatalf("budget_tokens not a number: %T %v",
+					thinking["budget_tokens"], thinking["budget_tokens"])
+			}
+			if got != tc.wantBudget {
+				t.Errorf("budget_tokens = %v, want %v", got, tc.wantBudget)
+			}
+		})
+	}
+}
+
+func TestBuildPayload_Thinking_NoneDisablesOnSupportingModel(t *testing.T) {
+	// ReasoningEffortNone is explicit suppression. On a model that
+	// would have supported thinking, we MUST send
+	// {"type":"disabled"} so the model knows not to reason — not
+	// the same as omitting the field, which would let the model's
+	// default behavior apply.
+	a := New()
+	body, err := a.BuildRequest(provider.Request{
+		Model:           "claude-opus-4-7",
+		Messages:        []provider.Message{userText("hi")},
+		ReasoningEffort: provider.ReasoningEffortNone,
+	})
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	payload := unmarshalRequest(t, body)
+	thinking, ok := payload["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected 'thinking' object on None for supporting model")
+	}
+	if thinking["type"] != "disabled" {
+		t.Errorf("type = %v, want disabled", thinking["type"])
+	}
+}
+
+func TestBuildPayload_Thinking_NonSupportingModelOmits(t *testing.T) {
+	// claude-3-5-sonnet predates thinking support. Even with
+	// ReasoningEffortHigh, the payload must omit the field —
+	// the API would 400 otherwise.
+	a := New()
+	body, err := a.BuildRequest(provider.Request{
+		Model:           "claude-3-5-sonnet-20241022",
+		Messages:        []provider.Message{userText("hi")},
+		ReasoningEffort: provider.ReasoningEffortHigh,
+	})
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	payload := unmarshalRequest(t, body)
+	if _, ok := payload["thinking"]; ok {
+		t.Errorf("payload has 'thinking' on non-supporting model: %v",
+			payload["thinking"])
+	}
+}
+
+func TestBuildPayload_Thinking_FixedBudgetBumpsMaxTokens(t *testing.T) {
+	// When a fixed budget is emitted, Anthropic requires
+	// max_tokens > budget_tokens. The adapter must bump max_tokens
+	// to budget + DefaultMaxTokens so the request doesn't 400.
+	a := Adapter{MaxTokens: 1024} // deliberately tiny
+	body, err := a.BuildRequest(provider.Request{
+		Model:           "claude-opus-4-5",
+		Messages:        []provider.Message{userText("hi")},
+		ReasoningEffort: provider.ReasoningEffortHigh, // budget=31999
+	})
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	payload := unmarshalRequest(t, body)
+	max, ok := payload["max_tokens"].(float64)
+	if !ok {
+		t.Fatalf("max_tokens not a number: %T", payload["max_tokens"])
+	}
+	want := float64(thinkingBudgetHigh + DefaultMaxTokens)
+	if max != want {
+		t.Errorf("max_tokens = %v, want %v (budget + DefaultMaxTokens)", max, want)
+	}
+}
+
+func TestBuildPayload_Thinking_AdaptiveDoesNotForceMaxTokensBump(t *testing.T) {
+	// Adaptive thinking doesn't have a concrete budget at request
+	// time. The adapter shouldn't bump max_tokens for adaptive
+	// because there's no fixed budget to clear.
+	a := Adapter{MaxTokens: 1024}
+	body, err := a.BuildRequest(provider.Request{
+		Model:           "claude-opus-4-7",
+		Messages:        []provider.Message{userText("hi")},
+		ReasoningEffort: provider.ReasoningEffortHigh,
+	})
+	if err != nil {
+		t.Fatalf("BuildRequest: %v", err)
+	}
+	payload := unmarshalRequest(t, body)
+	max, ok := payload["max_tokens"].(float64)
+	if !ok {
+		t.Fatalf("max_tokens not a number: %T", payload["max_tokens"])
+	}
+	if max != float64(1024) {
+		t.Errorf("max_tokens = %v, want 1024 (adaptive must not bump)", max)
+	}
+}
+
+// userText is a one-line helper for building a single-message
+// user turn in the test rig. Reduces noise in the table tests above.
+func userText(s string) provider.Message {
+	return provider.Message{
+		Role:    "user",
+		Content: []provider.ContentBlock{{Kind: provider.ContentText, Text: s}},
+	}
+}

@@ -1,6 +1,10 @@
 package workflow
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ashish-work/opendev-go/internal/provider"
+)
 
 func TestResolve(t *testing.T) {
 	exec := SlotConfig{Model: "gpt-4o"}
@@ -87,5 +91,70 @@ func TestSlotString(t *testing.T) {
 		if got := c.slot.String(); got != c.want {
 			t.Errorf("Slot(%d).String() = %q, want %q", c.slot, got, c.want)
 		}
+	}
+}
+
+func TestResolve_ReasoningEffortFallback(t *testing.T) {
+	// Verifies SlotConfig.ReasoningEffort follows the same
+	// fall-back-to-Execution rule that Model does. A slot whose
+	// effort is Unset inherits Execution's effort; an explicit
+	// value (including ReasoningEffortNone) wins over the default.
+	exec := SlotConfig{
+		Model:           "claude-opus-4-7",
+		ReasoningEffort: provider.ReasoningEffortHigh,
+	}
+
+	cases := []struct {
+		name string
+		cfg  Config
+		slot Slot
+		want provider.ReasoningEffort
+	}{
+		{
+			name: "execution returns its own effort verbatim",
+			cfg:  Config{Execution: exec},
+			slot: SlotExecution,
+			want: provider.ReasoningEffortHigh,
+		},
+		{
+			name: "compact unset falls back to execution's high",
+			cfg:  Config{Execution: exec},
+			slot: SlotCompact,
+			want: provider.ReasoningEffortHigh,
+		},
+		{
+			name: "compact explicit low wins over execution high",
+			cfg: Config{
+				Execution: exec,
+				Compact:   SlotConfig{ReasoningEffort: provider.ReasoningEffortLow},
+			},
+			slot: SlotCompact,
+			want: provider.ReasoningEffortLow,
+		},
+		{
+			name: "compact explicit None wins — explicit suppression",
+			cfg: Config{
+				Execution: exec,
+				Compact:   SlotConfig{ReasoningEffort: provider.ReasoningEffortNone},
+			},
+			slot: SlotCompact,
+			want: provider.ReasoningEffortNone,
+		},
+		{
+			name: "unset Execution + unset slot resolves to unset",
+			cfg:  Config{Execution: SlotConfig{Model: "x"}},
+			slot: SlotThinking,
+			want: provider.ReasoningEffortUnset,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.cfg.Resolve(tc.slot).ReasoningEffort
+			if got != tc.want {
+				t.Errorf("Resolve(%v).ReasoningEffort = %q, want %q",
+					tc.slot, got, tc.want)
+			}
+		})
 	}
 }
